@@ -1,3 +1,4 @@
 target
 /pi/*
 !/pi/.gitkeep
+!/pi/AGENTS.md
