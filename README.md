@@ -158,7 +158,6 @@ pi-vm version           CLI + CH versions, image hashes
   the command finishes, which is bad if a task has a problem halfway
   through)
 - pi-vm attach command to attach a shell to a running vm
-- possibly add goal mode extension
 - --rm flag, and maybe a shortcut for --no-mount for just asking quick questions
 - fix bug where all cqow's ref tables are being rebuilt on every create even after a valid build
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually
