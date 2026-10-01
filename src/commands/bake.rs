@@ -42,8 +42,8 @@ pub struct Bake {
     /// pi config dir to bake in (default: $PI_VM_PI_DIR, else ./pi)
     #[arg(long)]
     pub pi_dir: Option<String>,
-    /// Prep boot timeout in minutes (default 5)
-    #[arg(long, default_value_t = 5)]
+    /// Prep boot timeout in minutes (default 7)
+    #[arg(long, default_value_t = 7)]
     pub timeout: u32,
 }
 
@@ -530,12 +530,16 @@ echo "pi-vm baking toolchain...";
 (git config --system --replace-all user.name "Caleb Jones" 2>&1 | tail -1;
  git config --system --replace-all user.email "caleb@calebgj.io" 2>&1 | tail -1;
  echo "gitid rc=${{PIPESTATUS[0]}}") || true;
-(timeout 300 npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1 2>&1 | tail -3;
+(timeout 300 npm install -g --ignore-scripts @earendil-works/pi-coding-agent 2>&1 | tail -3;
  echo "npm rc=${{PIPESTATUS[0]}}") || true;
 (pi install npm:pi-web-access 2>&1 | tail -1;
  echo "piw rc=${{PIPESTATUS[0]}}") || true;
 (pi install npm:pi-subagents 2>&1 | tail -1;
  echo "pis rc=${{PIPESTATUS[0]}}") || true;
+(pi install npm:pi-goal-x 2>&1 | tail -1;
+ echo "pgx rc=${{PIPESTATUS[0]}}") || true;
+(timeout 300 pi update --extensions 2>&1 | tail -3;
+ echo "piupd rc=${{PIPESTATUS[0]}}") || true;
 grep -q SEARXNG_BASE_URL /etc/environment 2>/dev/null || echo "SEARXNG_BASE_URL=https://search.aandt.io/" >> /etc/environment;
 grep -q SEARXNG_BASE_URL /root/.bashrc 2>/dev/null || echo "export SEARXNG_BASE_URL=https://search.aandt.io/" >> /root/.bashrc;
 grep -q DefaultTimeoutStopSec /etc/systemd/system.conf 2>/dev/null || printf "DefaultTimeoutStopSec=30s\nFinalKillSignal=SIGKILL\n" >> /etc/systemd/system.conf;

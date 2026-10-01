@@ -101,8 +101,8 @@ pi-vm version           CLI + CH versions, image hashes
   timeout.
 - **Pre-baked base image** — `pi-vm bake` builds the base image: Fedora 44
   cloud + your pi config + the full toolchain (git, ripgrep, fd, node,
-  python3, cargo/rust, uv, docker + compose, pi + pi-web-access +
-  pi-subagents) + the direct-boot kernel assets. New VMs boot ready — no
+  python3, cargo/rust, uv, docker + compose, latest pi + pi-web-access +
+  pi-subagents + pi-goal-x) + the direct-boot kernel assets. New VMs boot ready — no
   first-boot install. Re-run `pi-vm bake` after changing the pi config.
 - **Direct kernel boot** — no UEFI, no GRUB: CH loads the kernel +
   initramfs straight from the baked assets (~5–8 s faster than a firmware
