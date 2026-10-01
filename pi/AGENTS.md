@@ -8,6 +8,9 @@ You are running as root inside a full-featured VM sandbox:
   can be installed on demand — when something you need to run is blocked
   by a missing tool, install the tools that are necessary.
 - It is safe to install packages, create files, and run destructive commands.
+- git push is intentionally not available (no remote access): the user
+  decides what gets pushed. Commit locally and leave pushing to the user —
+  do not try to work around it (tokens, HTTPS, new keys).
 - If you need to check code in dependencies, if you don't have it downloaded
   locally, clone the entire repo to `/tmp` to make searching through it easier.
 
