@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use crate::util::run_ok_priv;
+
 /// Root of all pi-vm state. Defaults to ~/.local/share/pi-vm, overridable
 /// via PI_VM_HOME (testability + non-standard installs).
 #[derive(Clone, Debug)]
@@ -341,7 +343,11 @@ impl VmLock {
     }
 }
 
-/// Delete a VM's bridge + tap + iptables rules (best-effort, like v1 delete.sh).
+/// Delete a VM's bridge + tap + iptables rules (best-effort, like v1
+/// delete.sh). Privileged (auto-sudo) — the setup path in vm.rs is
+/// privileged too, and a non-root `ip link del` would fail silently.
+/// Deleting the bridge also removes the enslaved tap; the explicit tap
+/// del is the fallback for a tap that was never enslaved.
 pub fn cleanup_network(meta: &VmMeta) {
     let br = meta.bridge_name();
     let tap = meta.tap_name();
@@ -353,7 +359,7 @@ pub fn cleanup_network(meta: &VmMeta) {
         vec!["iptables", "-D", "FORWARD", "-i", &br, "-j", "ACCEPT"],
         vec!["iptables", "-D", "FORWARD", "-o", &br, "-j", "ACCEPT"],
     ] {
-        let _ = std::process::Command::new(cmd[0]).args(&cmd[1..]).output();
+        let _ = run_ok_priv(cmd[0], &cmd[1..]);
     }
 }
 

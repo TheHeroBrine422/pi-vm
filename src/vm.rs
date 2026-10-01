@@ -5,8 +5,18 @@
 //!   - CH         -> background child (console file, api-socket)
 //!   - ssh        -> foreground child that inherits the terminal (M2 attach)
 //!
-//! VM lifetime = this process's lifetime. Exitting the ssh session (or Ctrl-C)
-//! runs the teardown: SIGTERM (graceful) -> SIGKILL -> kill virtiofsd.
+//! VM lifetime = this process's lifetime. Exiting the ssh session (Ctrl-C
+//! while booting, or SIGTERM in any state) runs the teardown: graceful
+//! guest poweroff -> SIGTERM -> SIGKILL -> kill virtiofsd -> delete the
+//! bridge/tap/iptables.
+//!
+//! Orphan protection: every child carries PR_SET_PDEATHSIG=SIGTERM (set in
+//! pre_exec, see child_pdeathsig) — if pi-vm dies for ANY reason, including
+//! SIGKILL, the kernel SIGTERMs each child: CH's SIGTERM is an immediate
+//! host-side poweroff, virtiofsd exits, the ssh client exits (the remote
+//! session ends). `kill -9 pi-vm` therefore stops the VM instead of
+//! orphaning it. (PR_SET_PDEATHSIG on pi-vm itself does NOT do this — it
+//! only signals pi-vm when its parent, e.g. the shell, dies.)
 
 use std::io::Write;
 use std::net::TcpStream;
@@ -382,10 +392,14 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     // slowness pushed ssh_ready out by minutes on slow hosts.
     let _ = std::fs::read(&iso);
 
-    // --- virtiofsd (background child; skipped for --no-mount VMs) ---
-    // If pi-vm dies abnormally (SIGKILL/crash), the children get SIGTERM —
-    // CH's SIGTERM is an immediate host-side poweroff, so the VM stops and
-    // doesn't leak (unflushed guest data may be lost — PLAN.md §3b.3).
+    // --- orphan protection ---
+    // (1) The children get PR_SET_PDEATHSIG=SIGTERM via pre_exec
+    // (child_pdeathsig): if pi-vm dies — for any reason, including SIGKILL —
+    // the kernel SIGTERMs each child: CH's SIGTERM is an immediate
+    // host-side poweroff, virtiofsd exits, the ssh client exits. The VM
+    // stops and doesn't leak (unflushed guest data may be lost — PLAN.md §3b.3).
+    // (2) pi-vm itself gets PR_SET_PDEATHSIG, so a dead shell (the terminal
+    // is closed) SIGTERMs pi-vm -> the SIGTERM handler tears down.
     set_pdeathsig();
     let squash = meta.squash_uid;
     let mut vfs_child: Option<Child> = match &meta.project {
@@ -397,17 +411,19 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             run_ok("chmod", &["a+w", project]); // sandbox guarantee (best effort)
             let vfs_log = std::fs::File::create(meta.vm_dir(home).join("virtiofsd.log"))
                 .map_err(|e| BootFail::Preflight(e.to_string()))?;
-            let mut child = Command::new(&vfs)
-                .args([
-                    &format!("--socket-path={}", sock.display()),
-                    &format!("--shared-dir={}", project),
-                    "--cache=auto",
-                    &format!("--translate-uid=squash-guest:0:{squash}:65536"),
-                    &format!("--translate-gid=squash-guest:0:{squash}:65536"),
-                ])
-                .stdin(Stdio::null())
-                .stdout(vfs_log.try_clone().unwrap())
-                .stderr(vfs_log) // v1: both streams to the log (not the user's terminal)
+            let mut cmd = Command::new(&vfs);
+            cmd.args([
+                &format!("--socket-path={}", sock.display()),
+                &format!("--shared-dir={}", project),
+                "--cache=auto",
+                &format!("--translate-uid=squash-guest:0:{squash}:65536"),
+                &format!("--translate-gid=squash-guest:0:{squash}:65536"),
+            ]);
+            cmd.stdin(Stdio::null());
+            cmd.stdout(vfs_log.try_clone().unwrap());
+            cmd.stderr(vfs_log); // v1: both streams to the log (not the user's terminal)
+            with_pdeathsig(&mut cmd);
+            let mut child = cmd
                 .spawn()
                 .map_err(|e| BootFail::Preflight(format!("spawn virtiofsd: {e}")))?;
             thread::sleep(Duration::from_secs(1));
@@ -462,12 +478,13 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             meta.vm_dir(home).join("fs.sock").display()
         ));
     }
-    let mut ch_child = match Command::new(&ch)
-        .args(&ch_args)
-        .stdin(Stdio::null())
-        .stdout(console_file.try_clone().unwrap())
-        .stderr(console_file)
-        .spawn()
+    let mut ch_cmd = Command::new(&ch);
+    ch_cmd.args(&ch_args);
+    ch_cmd.stdin(Stdio::null());
+    ch_cmd.stdout(console_file.try_clone().unwrap());
+    ch_cmd.stderr(console_file);
+    with_pdeathsig(&mut ch_cmd);
+    let mut ch_child = match ch_cmd.spawn()
     {
         Ok(c) => c,
         Err(e) => {
@@ -501,9 +518,12 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     }
     println!("   connect: ssh -i {} root@{}", key.display(), meta.ip);
 
-    // signal handling: Ctrl-C / SIGTERM during boot-wait aborts + tears down
+    // Signal handling: Ctrl-C (SIGINT) and SIGTERM set separate flags.
+    // Ctrl-C interrupts the boot-wait only (while attached it goes to the
+    // remote session); SIGTERM tears down in every state.
     let interrupted = Arc::new(AtomicBool::new(false));
-    install_signal_handler(interrupted.clone());
+    let terminated = Arc::new(AtomicBool::new(false));
+    install_signal_handler(interrupted.clone(), terminated.clone());
 
     // --- wait for ssh ---
     let boot_deadline = 180;
@@ -513,7 +533,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     while waited < boot_deadline {
         thread::sleep(Duration::from_secs(2));
         waited += 2;
-        if interrupted.load(Ordering::Relaxed) {
+        if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
             break;
         }
         if ch_child.try_wait().ok().flatten().is_some() {
@@ -555,7 +575,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     }
     println!();
     if !ready {
-        if interrupted.load(Ordering::Relaxed) {
+        if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
             eprintln!("interrupted — tearing down");
         } else {
             eprintln!("VM did not become ssh-reachable in {boot_deadline}s — console tail:");
@@ -574,7 +594,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
 
     // --- attach or foreground-wait ---
     let code = if attach {
-        println!("==> attached — exiting the ssh session stops the VM (Ctrl-C works while booting)");
+        println!("==> attached — exiting the ssh session stops the VM (Ctrl-C goes to the remote session; SIGTERM stops the VM)");
         let key_s = key.to_string_lossy().into_owned();
         let target = format!("root@{}", meta.ip);
         let mut ssh = Command::new("ssh");
@@ -597,24 +617,44 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             "cd /workspace; pi"
         };
         ssh.arg(attach_cmd);
-        let status = ssh
+        with_pdeathsig(&mut ssh);
+        // Poll rather than block on status(): a SIGTERM to the supervisor
+        // must tear the VM down even while attached (the old blocking
+        // status() made `kill <pi-vm-pid>` a no-op — the flag was set but
+        // never checked). Ctrl-C (SIGINT) is deliberately NOT checked here:
+        // the terminal delivers it to the foreground group and ssh forwards
+        // it to the remote session (docker-attach semantics).
+        match ssh
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .status();
-        match status {
-            Ok(s) => s.code().unwrap_or(0),
+            .spawn()
+        {
             Err(e) => {
                 eprintln!("ssh attach failed: {e} — the VM is still running; reconnect with `pi-vm resume {}`", meta.id);
                 1
             }
+            Ok(mut ssh) => loop {
+                if terminated.load(Ordering::Relaxed) {
+                    eprintln!("SIGTERM — stopping the ssh session and the VM");
+                    libc_kill(ssh.id(), 15);
+                }
+                match ssh.try_wait() {
+                    Ok(Some(s)) => break s.code().unwrap_or(0),
+                    Ok(None) => thread::sleep(Duration::from_millis(200)),
+                    Err(e) => {
+                        eprintln!("ssh attach failed: {e} — the VM is still running; reconnect with `pi-vm resume {}`", meta.id);
+                        break 1;
+                    }
+                }
+            },
         }
     } else {
         // non-interactive: run until CH exits or we're interrupted
         println!("==> running in foreground (Ctrl-C stops the VM)");
         loop {
             thread::sleep(Duration::from_secs(1));
-            if interrupted.load(Ordering::Relaxed) {
+            if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
                 break;
             }
             if ch_child.try_wait().ok().flatten().is_some() {
@@ -712,7 +752,13 @@ fn teardown(home: &VmHome, meta: &VmMeta, ch: &mut Child, vfs: &mut Option<Child
     }
     let _ = ch.wait();
 
-    // 6. state
+    // 6. network (bridge + tap + iptables). Best effort: the setup path is
+    // idempotent, so a missed cleanup is healed on the next boot — but a
+    // stale bridge would keep the subnet allocated (the live-interface
+    // check in allocate_subnet sees its .1) and leak the kernel objects.
+    state::cleanup_network(meta);
+
+    // 7. state
     let mut m = meta.clone();
     m.state = VmState::Stopped;
     m.ch_pid = None;
@@ -720,9 +766,13 @@ fn teardown(home: &VmHome, meta: &VmMeta, ch: &mut Child, vfs: &mut Option<Child
     let _ = m.save(home);
 }
 
-/// Make the kernel send SIGTERM to our children if this process dies
-/// abnormally (SIGKILL/crash) — CH's SIGTERM handler is the graceful exit
-/// path, so the VM + virtiofsd don't leak when pi-vm is killed.
+/// Make the kernel send SIGTERM to THIS process when its parent (the shell
+/// that launched pi-vm) dies — e.g. the terminal is closed. With the
+/// SIGTERM handler, that triggers the graceful teardown.
+///
+/// NOTE: this does NOT protect pi-vm's children — PR_SET_PDEATHSIG signals
+/// the calling process on its parent's death, not the other way around.
+/// The children get their own PR_SET_PDEATHSIG via child_pdeathsig().
 #[cfg(unix)]
 fn set_pdeathsig() {
     unsafe extern "C" {
@@ -734,6 +784,39 @@ fn set_pdeathsig() {
 }
 #[cfg(not(unix))]
 fn set_pdeathsig() {}
+
+/// Runs in the child after fork, before exec: when this process (the
+/// supervisor) dies — for any reason, including SIGKILL — the kernel sends
+/// SIGTERM to the child. CH's SIGTERM = vmm_shutdown (immediate host-side
+/// poweroff), virtiofsd exits (its forked daemon carries its own
+/// PR_SET_PDEATHSIG, so killing the parent kills both), the ssh client
+/// exits (the remote session ends). This is what prevents `kill -9 pi-vm`
+/// from orphaning the VM.
+fn child_pdeathsig() -> std::io::Result<()> {
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn prctl(option: i32, arg2: i32) -> i32;
+    }
+    #[cfg(unix)]
+    unsafe {
+        if prctl(1, 15) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Attach child_pdeathsig to a spawn. (pre_exec is Unix-only; the stub
+/// keeps non-Unix builds compiling — the tool itself is Linux-oriented.)
+#[cfg(unix)]
+fn with_pdeathsig(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| child_pdeathsig());
+    }
+}
+#[cfg(not(unix))]
+fn with_pdeathsig(_cmd: &mut Command) {}
 
 /// Send an arbitrary signal to a pid (Child::kill only sends SIGKILL).
 #[cfg(unix)]
@@ -811,9 +894,12 @@ fn qemu_img_cleanly_closed(disk: &std::path::Path) -> bool {
         .unwrap_or(true)
 }
 
-fn install_signal_handler(flag: Arc<AtomicBool>) {
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, flag);
+/// SIGINT (Ctrl-C) and SIGTERM set separate flags: Ctrl-C only interrupts
+/// the boot-wait (while attached it goes to the remote session); SIGTERM
+/// tears down in every state.
+fn install_signal_handler(interrupted: Arc<AtomicBool>, terminated: Arc<AtomicBool>) {
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted);
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, terminated);
 }
 
 /// The cloud-init runcmd (ported from v1 start.sh — the pre-baked

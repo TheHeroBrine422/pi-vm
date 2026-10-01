@@ -127,7 +127,11 @@ pi-vm version           CLI + CH versions, image hashes
   when the ssh session ends — for the default attach, when you exit `pi`
   — via a graceful guest poweroff. For non-interactive runs, Ctrl-C/SIGTERM
   interrupts (exit 130) and tears the VM down the same graceful way. The
-  disk is left intact for `pi-vm resume`.
+  disk is left intact for `pi-vm resume`. `kill <pi-vm-pid>` (SIGTERM)
+  works in every state — while attached it stops the ssh session and tears
+  the VM down the same graceful way. `kill -9` no longer orphans the VM
+  either: every child carries PR_SET_PDEATHSIG, so a dead supervisor
+  SIGTERMs CH (immediate host-side poweroff) + virtiofsd + the ssh client.
 - **Why does ssh take a while to come up?** The baked `pi-vm-net` unit
   runs a convergence loop (up to 60 s) that brings up the network + ssh as
   soon as the underlying devices are ready, in parallel with sshd, and
@@ -143,7 +147,11 @@ pi-vm version           CLI + CH versions, image hashes
 
 - SIGKILL of CH mid-write can tear the qcow2 disk (L2 table update is not
   atomic with the data write) — the disk may need recreating. Stop
-  gracefully (guest poweroff / SIGTERM).
+  gracefully (guest poweroff / SIGTERM). `kill -9 pi-vm` is safe-ish by
+  contrast: the children carry PR_SET_PDEATHSIG, so a dead supervisor
+  SIGTERMs CH (immediate poweroff — unflushed guest data may be lost, same
+  as the SIGTERM fallback), and the next resume self-heals the refcount
+  table if the poweroff landed mid-write.
 - `vmm.shutdown` API = `vm_delete()` in CH — abrupt, NOT graceful. Never
   use it for VMs whose disk must be re-opened.
 - virtiofsd lives in `/usr/libexec` on Fedora (not in PATH).
@@ -153,7 +161,6 @@ pi-vm version           CLI + CH versions, image hashes
 ## TODO
 
 - Separate VM work trees via CoW
-- tap/bridge don't appear to be cleaned up properly
 - A better solution for long-running commands (the LLM loses control until
   the command finishes, which is bad if a task has a problem halfway
   through)
@@ -162,6 +169,14 @@ pi-vm version           CLI + CH versions, image hashes
 - fix bug where all cqow's ref tables are being rebuilt on every create even after a valid build
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually
 - fix git signatures failing for commits inside the sandbox
+- ability to set extensions to be baked into the image as a setting for pi-vm rather then it being hard coded
+- terminal tab name based on vm id and mounted project directory
+- RESOLVED (hang.log): the stuck terminal was a red herring — the real bug
+  was that killing the stuck pi-vm (SIGTERM or SIGKILL) orphaned the VM:
+  CH + virtiofsd + ssh kept running with no supervisor. Fixed: children
+  carry PR_SET_PDEATHSIG (kill -9 of pi-vm now SIGTERMs them), SIGTERM
+  while attached tears down, and teardown deletes the bridge/tap/iptables.
+  Cleanup for the orphaned VM: docs/cleanup-orphaned-vm.sh
 - Later goals (not required for v1):
   - Block git write actions (make git read-only somehow)
   - Simplify subagents (fewer options for subagent types)
