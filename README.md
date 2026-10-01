@@ -11,7 +11,6 @@ project.
 ```
 pi/         pi config
 src/        the pi-vm CLI (Rust)
-tools/      bench-boot.sh (boot time benchmark)
 docs/       forwarding.md (reaching private/remote services from a VM)
 ```
 
