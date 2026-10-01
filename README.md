@@ -162,9 +162,11 @@ pi-vm version           CLI + CH versions, image hashes
 - fix bug where all cqow's ref tables are being rebuilt on every create even after a valid build
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually
 - fix git signatures failing for commits inside the sandbox
+- possibly commit pi/AGENTS.md to the repo, since that contains instructions specifically for the sandbox
 - Later goals (not required for v1):
   - Block git write actions (make git read-only somehow)
   - Simplify subagents (fewer options for subagent types)
+    - might also be a good idea to add a note to the AGENTS.md file to use subagents in cases where it is doing multiple large tasks that can be done in parallel
   - A review fanout mechanism using the worktrees feature: spawn N (default
     4) agents with separate worktrees, have them thoroughly review and test
     the project and place the output at ISSUES.md, then have another agent
