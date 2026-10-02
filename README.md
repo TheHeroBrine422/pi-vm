@@ -164,19 +164,19 @@ pi-vm version           CLI + CH versions, image hashes
 - A better solution for long-running commands (the LLM loses control until
   the command finishes, which is bad if a task has a problem halfway
   through)
+- disable git safe.directory entirely
 - pi-vm attach command to attach a shell to a running vm
 - --rm flag, and maybe a shortcut for --no-mount for just asking quick questions
-- fix bug where all cqow's ref tables are being rebuilt on every create even after a valid build
+- fix bug where all qcow's ref tables are being rebuilt on every create even after a valid build
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually
 - fix git signatures failing for commits inside the sandbox
 - ability to set extensions to be baked into the image as a setting for pi-vm rather then it being hard coded
 - terminal tab name based on vm id and mounted project directory
-- RESOLVED (hang.log): the stuck terminal was a red herring — the real bug
-  was that killing the stuck pi-vm (SIGTERM or SIGKILL) orphaned the VM:
-  CH + virtiofsd + ssh kept running with no supervisor. Fixed: children
-  carry PR_SET_PDEATHSIG (kill -9 of pi-vm now SIGTERMs them), SIGTERM
-  while attached tears down, and teardown deletes the bridge/tap/iptables.
-  Cleanup for the orphaned VM: docs/cleanup-orphaned-vm.sh
+- have install check for cloud-hypervisor binaries on PATH and other assets before downloading to have better compatibility with other install methods (ex: rpm spec)
+  - related: make install not reliant on dnf.
+- include a hash of the prebaked image in the vm metadata so you can know if the vm is based on the most recent baked image
+- possibly keep older versions of the baked image and add a `pi-vm images` command?
+- codemode
 - Later goals (not required for v1):
   - Block git write actions (make git read-only somehow)
   - Simplify subagents (fewer options for subagent types)
