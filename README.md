@@ -181,6 +181,7 @@ pi-vm version           CLI + CH versions, image hashes
   - Block git write actions (make git read-only somehow)
   - Simplify subagents (fewer options for subagent types)
     - might also be a good idea to add a note to the AGENTS.md file to use subagents in cases where it is doing multiple large tasks that can be done in parallel
+    - it would be cool for there to be a good way for it to spin up subagents in a separate VM
   - A review fanout mechanism using the worktrees feature: spawn N (default
     4) agents with separate worktrees, have them thoroughly review and test
     the project and place the output at ISSUES.md, then have another agent
