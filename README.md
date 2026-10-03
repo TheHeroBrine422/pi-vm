@@ -4,7 +4,7 @@ A CLI for creating Pi VM sandboxes. One binary supervises Cloud
 Hypervisor + virtiofsd per VM and drops you straight into `pi` in the
 project.
 
-**Warning:** This project was written for me and is not polished.
+**Warning:** This project was written for personal use and is not polished.
 
 ## Layout
 
