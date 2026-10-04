@@ -166,6 +166,13 @@ pi-vm version           CLI + CH versions, image hashes
   table if the poweroff landed mid-write.
 - `vmm.shutdown` API = `vm_delete()` in CH — abrupt, NOT graceful. Never
   use it for VMs whose disk must be re-opened.
+- **Nested virtiofs**: when the shared folder itself lives on a virtiofs
+  mount (e.g. running pi-vm inside one of its own VMs), guest file
+  creation in the mount can fail with `Unknown system error -116`
+  (ENOKEY) — observed on pi session-file creation. Workaround: put the
+  shared folder on the VM's local disk (e.g. /tmp) for nested use.
+  (The prompt-run's `mkdir -p` + manager-side retry-on-fast-abnormal-exit
+  paper over the transient cases.)
 - virtiofsd lives in `/usr/libexec` on Fedora (not in PATH).
 - The guest's root partition/fs grow to `--disk` on first boot via the
   cloud image's growpart/resizefs (the base is 5G virtual).
