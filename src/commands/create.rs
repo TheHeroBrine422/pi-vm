@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use clap::Args;
 
 use crate::state::VmHome;
-use crate::vm::{boot, create_vm, VmConfig};
+use crate::vm::{boot, create_vm, PromptRun, VmConfig};
 
 #[derive(Args)]
 pub struct Create {
@@ -38,6 +38,19 @@ pub struct Create {
     /// Attach to a plain shell in /workspace instead of starting the agent
     #[arg(long)]
     pub shell: bool,
+    /// Headless: run `pi --print` with this prompt file, capture the log,
+    /// then stop the VM (non-interactive only; needs a shared mount)
+    #[arg(long)]
+    pub prompt_file: Option<String>,
+    /// Kill the prompt run after N seconds (exit code 124)
+    #[arg(long)]
+    pub timeout: Option<u32>,
+    /// Guest pi --session-dir, a path under /workspace (default .pi-vm/sessions)
+    #[arg(long)]
+    pub session_dir: Option<String>,
+    /// Leave the VM running after the prompt run (pi-vm resume <id>)
+    #[arg(long)]
+    pub keep: bool,
 }
 
 impl Create {
@@ -58,6 +71,25 @@ impl Create {
                 return 2;
             }
         };
+        let prompt = match &self.prompt_file {
+            Some(pf) => {
+                if self.no_mount || project.is_none() {
+                    eprintln!("error: --prompt-file requires a shared mount (a path)");
+                    return 2;
+                }
+                if self.shell {
+                    eprintln!("error: --prompt-file and --shell are contradictory");
+                    return 2;
+                }
+                Some(PromptRun {
+                    prompt_file: pf.clone(),
+                    timeout_s: self.timeout,
+                    session_dir: self.session_dir.clone().unwrap_or_else(|| ".pi-vm/sessions".into()),
+                    keep: self.keep,
+                })
+            }
+            None => None,
+        };
         let cfg = VmConfig {
             project,
             name: self.name.clone(),
@@ -76,7 +108,7 @@ impl Create {
                 return 2;
             }
         };
-        match boot(home, meta, attach, self.console, self.shell) {
+        match boot(home, meta, attach, self.console, self.shell, prompt) {
             Ok(code) => code,
             Err(f) => {
                 eprintln!("error: {}", f.msg());

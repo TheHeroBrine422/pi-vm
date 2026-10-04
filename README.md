@@ -39,12 +39,24 @@ pi-vm bake [--pi-dir D] [--timeout N]
                          build-time COPY
 pi-vm create [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
               [--extra-disk N] [--kvm on|off] [--squash-uid U] [--no-mount]
-              [--console] [--shell]
+              [--console] [--shell] [--prompt-file F] [--timeout N]
+              [--session-dir D] [--keep]
                          new VM from the pre-baked base (no path, or
                          --no-mount, = no shared mount: no virtiofsd, no
                          /workspace in the guest); boots and (if the
                          terminal is interactive) attaches an ssh session
                          that starts in pi (cd /workspace; pi)
+                         --prompt-file F (non-interactive): headless run —
+                         copies F into the mount at .pi-vm/prompt.txt,
+                         runs `pi --print @.pi-vm/prompt.txt` over ssh,
+                         captures stdout in .pi-vm/agent.log, then stops
+                         the VM. --timeout N kills the run after N s
+                         (exit 124; the workspace is on the host, so
+                         partial results survive). --session-dir D sets
+                         the guest pi --session-dir (a path under
+                         /workspace; default .pi-vm/sessions) so the
+                         session lands on the host. --keep leaves the VM
+                         running after the prompt run (pi-vm resume).
 pi-vm resume <id|name> [--console] [--shell]
                          boot an existing VM and attach
 pi-vm list [-v]         all VMs (docker ps -a style; alias: pi-vm ls)

@@ -78,6 +78,18 @@ pub struct VmConfig {
     pub squash_uid: Option<u32>,
 }
 
+/// A headless pi run inside a freshly booted VM.
+pub struct PromptRun {
+    /// Host path to the prompt file (copied into the mount at .pi-vm/prompt.txt).
+    pub prompt_file: String,
+    /// Kill the run after N seconds (exit code 124).
+    pub timeout_s: Option<u32>,
+    /// Guest --session-dir, a path under /workspace (host path inside the mount).
+    pub session_dir: String,
+    /// Leave the VM running after the prompt run (pi-vm resume <id>).
+    pub keep: bool,
+}
+
 /// Create a new VM: id, meta, ssh key, disk copy + resize.
 pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     // preflight
@@ -248,7 +260,8 @@ pub fn direct_boot_args(home: &VmHome) -> Option<Vec<String>> {
 }
 
 /// Boot the VM and (if attach) drop into ssh. Returns the exit code.
-pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: bool) -> Result<i32, BootFail> {
+pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: bool,
+           prompt: Option<PromptRun>) -> Result<i32, BootFail> {
     let boot_start = std::time::Instant::now();
     let _lock = state::VmLock::acquire(&meta, home)
         .map_err(BootFail::InUse)?;
@@ -650,22 +663,123 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             },
         }
     } else {
-        // non-interactive: run until CH exits or we're interrupted
-        println!("==> running in foreground (Ctrl-C stops the VM)");
-        loop {
-            thread::sleep(Duration::from_secs(1));
-            if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
-                break;
-            }
-            if ch_child.try_wait().ok().flatten().is_some() {
-                break;
+        // non-interactive: optional headless prompt run, then run until CH
+        // exits or we're interrupted (or the prompt run finished and !keep)
+        let mut prompt_code: Option<i32> = None;
+        let mut keep = false;
+        if let Some(pr) = prompt {
+            match run_prompt_run(&meta, &pr, &key, &interrupted, &terminated) {
+                Ok(c) => {
+                    println!("==> prompt run finished (code {c})");
+                    prompt_code = Some(c);
+                    keep = pr.keep;
+                    if pr.keep {
+                        println!("==> VM kept running — reconnect: pi-vm resume {}", meta.id);
+                    }
+                }
+                Err(f) => {
+                    teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock);
+                    return Err(f);
+                }
             }
         }
-        0
+        if prompt_code.is_none() || keep {
+            if prompt_code.is_none() {
+                println!("==> running in foreground (Ctrl-C stops the VM)");
+            }
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
+                    break;
+                }
+                if ch_child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+            }
+            0
+        } else {
+            prompt_code.unwrap()
+        }
     };
 
     teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock);
     Ok(code)
+}
+
+/// Headless prompt run: copy the prompt into the mount, run
+/// `pi --print @prompt` over ssh (with the session dir), capture stdout
+/// in the mount's .pi-vm/agent.log, and return the exit code. A timeout
+/// kills the ssh client (the remote pi gets SIGHUP) -> 124. Interrupted
+/// -> 130. The workspace is on the host, so a killed run still preserves
+/// everything the agent wrote before the kill.
+fn run_prompt_run(meta: &VmMeta, pr: &PromptRun, key: &std::path::Path,
+                  interrupted: &Arc<AtomicBool>, terminated: &Arc<AtomicBool>)
+    -> Result<i32, BootFail> {
+    let project = meta.project.as_ref().ok_or_else(|| BootFail::Preflight(
+        "a prompt run requires a shared mount (a path)".into()))?;
+    let pdir = std::path::Path::new(project).join(".pi-vm");
+    std::fs::create_dir_all(&pdir)
+        .map_err(|e| BootFail::Other(format!("create .pi-vm dir: {e}")))?;
+    std::fs::copy(&pr.prompt_file, pdir.join("prompt.txt"))
+        .map_err(|e| BootFail::Other(format!("copy prompt file: {e}")))?;
+    let session_host = std::path::Path::new(project).join(&pr.session_dir);
+    std::fs::create_dir_all(&session_host)
+        .map_err(|e| BootFail::Other(format!("create session dir: {e}")))?;
+    let log_path = pdir.join("agent.log");
+    let log = std::fs::File::create(&log_path)
+        .map_err(|e| BootFail::Other(format!("create agent.log: {e}")))?;
+
+    let cmd = format!(
+        "cd /workspace && pi --session-dir {} --print @.pi-vm/prompt.txt",
+        pr.session_dir
+    );
+    let mut ssh = Command::new("ssh");
+    ssh.arg("-i")
+        .arg(key.to_string_lossy().to_string())
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(format!("root@{}", meta.ip))
+        .arg(cmd)
+        .stdout(log)
+        .stderr(Stdio::inherit());
+    with_pdeathsig(&mut ssh);
+    let mut child = ssh
+        .spawn()
+        .map_err(|e| BootFail::Other(format!("ssh prompt run failed: {e}")))?;
+
+    let t0 = std::time::Instant::now();
+    loop {
+        if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
+            eprintln!("interrupted — stopping the prompt run");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(130);
+        }
+        match child.try_wait() {
+            Ok(Some(s)) => return Ok(s.code().unwrap_or(0)),
+            Ok(None) => {
+                if let Some(t) = pr.timeout_s {
+                    if t0.elapsed() >= Duration::from_secs(t as u64) {
+                        eprintln!("prompt run timed out after {t}s — killing");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(124);
+                    }
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => {
+                eprintln!("ssh prompt run failed: {e}");
+                return Ok(1);
+            }
+        }
+    }
 }
 
 /// Teardown: graceful GUEST poweroff (ssh `systemctl poweroff`) up to 120 s,
