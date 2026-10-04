@@ -164,6 +164,7 @@ pi-vm version           CLI + CH versions, image hashes
 - A better solution for long-running commands (the LLM loses control until
   the command finishes, which is bad if a task has a problem halfway
   through)
+  - this is also an issue for long running autonoumus sessions. a command hung for 2-3h and the LLM had no way of dealing with it. I think a hardcap on timeout and maybe an instruction to do background tasks for long tasks and check output?
 - disable git safe.directory entirely
 - pi-vm attach command to attach a shell to a running vm
 - --rm flag, and maybe a shortcut for --no-mount for just asking quick questions
@@ -177,6 +178,8 @@ pi-vm version           CLI + CH versions, image hashes
 - include a hash of the prebaked image in the vm metadata so you can know if the vm is based on the most recent baked image
 - possibly keep older versions of the baked image and add a `pi-vm images` command?
 - codemode
+- maybe change this where you need to run it with sudo or similar to like the root access thing docker does since having sudo in the script is annoying cause if it times out you have to type in the password at the start and end of the session
+- CTRL+Z hangs the session. it seems to result in you disconnecting from the ssh, but also not able to stop the process with CTRL+C. its what made me need to run kill -9 in the past. running kill on the pid this time cleaned it up properly.
 - Later goals (not required for v1):
   - Block git write actions (make git read-only somehow)
   - Simplify subagents (fewer options for subagent types)
