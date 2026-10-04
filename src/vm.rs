@@ -730,8 +730,8 @@ fn run_prompt_run(meta: &VmMeta, pr: &PromptRun, key: &std::path::Path,
         .map_err(|e| BootFail::Other(format!("create agent.log: {e}")))?;
 
     let cmd = format!(
-        "cd /workspace && pi --session-dir {} --print @.pi-vm/prompt.txt",
-        pr.session_dir
+        "cd /workspace && mkdir -p {} && pi --session-dir {} --print @.pi-vm/prompt.txt",
+        pr.session_dir, pr.session_dir
     );
     let mut ssh = Command::new("ssh");
     ssh.arg("-i")
