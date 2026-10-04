@@ -539,7 +539,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     install_signal_handler(interrupted.clone(), terminated.clone());
 
     // --- wait for ssh ---
-    let boot_deadline = 180;
+    let boot_deadline = 300;
     let mut waited = 0;
     let mut ready = false;
     let mut console_pos: u64 = 0;
