@@ -516,7 +516,7 @@ fi
         r#"
 exec >> /root/bake-debug.log 2>&1;
 echo "pi-vm baking toolchain...";
-(timeout 300 dnf install -y git curl wget ripgrep fd xz bzip2 tar gzip xfsprogs python3 python3-pip cargo uv which cloud-utils-growpart btrfs-progs 2>&1 | tail -3;
+(timeout 300 dnf install -y git curl wget ripgrep fd xz bzip2 tar gzip xfsprogs python3 python3-pip cargo uv which cloud-utils-growpart btrfs-progs tmux 2>&1 | tail -3;
  echo "dnf1 rc=${{PIPESTATUS[0]}}") || true;
 (timeout 600 dnf install -y docker docker-compose 2>&1 | tail -2;
  systemctl enable --now docker 2>&1 | tail -1;
@@ -599,6 +599,7 @@ iso_done=0
 net_done=0
 ssh_done=0
 grow_done=0
+agent_done=0
 
 for i in $(seq 1 60); do
   # 1. virtiofs. Give up after 15 consecutive failures (assume no device —
@@ -731,8 +732,28 @@ for i in $(seq 1 60); do
     fi
   fi
 
+  # 7. agent (only once the ISO is readable): install the launch script +
+  #    prompt from the ISO, or RESET when this boot delivers none (the
+  #    disk persists — a stale script would relaunch an old agent); then
+  #    start the tmux session if the script is present (the timer does
+  #    the same on every tick — this is the fast path).
+  if [ "$iso_done" -eq 1 ] && [ "$agent_done" -eq 0 ]; then
+    if [ -f /mnt/nocloud/pi-launch.sh ]; then
+      install -m 755 /mnt/nocloud/pi-launch.sh /usr/local/bin/pi-vm-launch.sh 2>/dev/null
+      chcon -t bin_t /usr/local/bin/pi-vm-launch.sh 2>/dev/null || true
+      [ -f /mnt/nocloud/pi-prompt.txt ] && cp /mnt/nocloud/pi-prompt.txt /root/pi-prompt.txt
+      if ! tmux has-session -t agent 2>/dev/null; then
+        tmux new-session -d -s agent -f /dev/null "tmux set status off; PI_VM_SERVICE=1 /usr/local/bin/pi-vm-launch.sh" 2>/dev/null
+      fi
+    else
+      rm -f /usr/local/bin/pi-vm-launch.sh /root/pi-prompt.txt
+      tmux kill-session -t agent 2>/dev/null
+    fi
+    agent_done=1
+  fi
+
   # converged? exit early (a healthy VM breaks at ~iteration 1-2).
-  if [ "$vfs_done" -eq 1 ] && [ "$extra_done" -eq 1 ] && [ "$iso_done" -eq 1 ] && [ "$net_done" -eq 1 ] && [ "$ssh_done" -eq 1 ] && [ "$grow_done" -eq 1 ]; then
+  if [ "$vfs_done" -eq 1 ] && [ "$extra_done" -eq 1 ] && [ "$iso_done" -eq 1 ] && [ "$net_done" -eq 1 ] && [ "$ssh_done" -eq 1 ] && [ "$grow_done" -eq 1 ] && [ "$agent_done" -eq 1 ]; then
     break
   fi
   sleep 1
@@ -751,6 +772,20 @@ const NET_SERVICE: &str = "[Unit]\nDescription=pi-vm network and ssh setup from 
 // ticks are no-ops. It never blocks multi-user (the timer is passive).
 const NET_START_TIMER: &str = "[Unit]\nDescription=Start pi-vm network setup (repeating until the root fs is up)\n\n[Timer]\nOnBootSec=1s\nOnUnitActiveSec=1s\nUnit=pi-vm-net.service\n\n[Install]\nWantedBy=timers.target\n";
 
+// The agent session starter: each tick (1 s) checks, and ONLY if the
+// launch script is present AND no 'agent' session exists yet, starts the
+// detached tmux session. RemainAfterExit=no — the unit returns to inactive
+// after each run, so the next tick can re-trigger it (a oneshot with
+// RemainAfterExit=yes would run ONCE and the later ticks would be no-ops;
+// the script may land after boot, via the net-fallback loop, so the
+// starter must stay re-triggerable). PI_VM_SERVICE=1 makes the launch
+// script power the VM off when pi exits (frees the VM for the next one).
+// The session command disables the tmux status line (pi is a full-screen
+// TUI; the line would steal a row).
+const AGENT_SERVICE: &str = "[Unit]\nDescription=pi-vm agent session starter (tmux session 'agent')\n\n[Service]\nType=oneshot\nRemainAfterExit=no\nTimeoutStartSec=60\nExecStart=/usr/bin/env bash -c 'test -x /usr/local/bin/pi-vm-launch.sh && ! tmux has-session -t agent 2>/dev/null && tmux new-session -d -s agent -f /dev/null \"tmux set status off; PI_VM_SERVICE=1 /usr/local/bin/pi-vm-launch.sh\"'\n";
+
+const AGENT_START_TIMER: &str = "[Unit]\nDescription=Start pi-vm agent session (repeating while the launch script is present)\n\n[Timer]\nOnBootSec=1s\nOnUnitActiveSec=1s\nUnit=pi-vm-agent.service\n\n[Install]\nWantedBy=timers.target\n";
+
 /// Write the net-fallback script + units into the baked image (one
 /// patient guestfish RW session; the -i inspection mounts the btrfs
 /// root subvolume at /sysroot).
@@ -758,10 +793,12 @@ fn write_net_fallback(part: &std::path::Path) {
     println!("   installing the cloud-init-independent net fallback");
     let tmp = std::env::temp_dir().join(format!("pi-vm-netfb-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
-    let entries: [(&str, &str); 3] = [
+    let entries: [(&str, &str); 5] = [
         ("pi-vm-net.sh", NET_SCRIPT),
         ("pi-vm-net.service", NET_SERVICE),
         ("pi-vm-net-start.timer", NET_START_TIMER),
+        ("pi-vm-agent.service", AGENT_SERVICE),
+        ("pi-vm-agent-start.timer", AGENT_START_TIMER),
     ];
     for (name, content) in &entries {
         if std::fs::write(tmp.join(name), content).is_err() {
@@ -782,7 +819,7 @@ fn write_net_fallback(part: &std::path::Path) {
     cmds.push("mkdir-p /workspace".into());
     // guestfish `ln` makes a HARD link (systemd needs a symlink); the
     // appliance has sh, so do the symlinks + chmod in one sh -c.
-    cmds.push("command \"sh -c 'rm -f /etc/systemd/system/multi-user.target.wants/pi-vm-net.service /etc/systemd/system/pi-vm-net-late.service /etc/systemd/system/pi-vm-net-late.timer /etc/systemd/system/timers.target.wants/pi-vm-net-late.timer; ln -sf /etc/systemd/system/pi-vm-net-start.timer /etc/systemd/system/timers.target.wants/pi-vm-net-start.timer; chmod 755 /usr/local/bin/pi-vm-net.sh'\"".into());
+    cmds.push("command \"sh -c 'rm -f /etc/systemd/system/multi-user.target.wants/pi-vm-net.service /etc/systemd/system/pi-vm-net-late.service /etc/systemd/system/pi-vm-net-late.timer /etc/systemd/system/timers.target.wants/pi-vm-net-late.timer; ln -sf /etc/systemd/system/pi-vm-net-start.timer /etc/systemd/system/timers.target.wants/pi-vm-net-start.timer; ln -sf /etc/systemd/system/pi-vm-agent-start.timer /etc/systemd/system/timers.target.wants/pi-vm-agent-start.timer; chmod 755 /usr/local/bin/pi-vm-net.sh'\"".into());
     // Boot optimizations (persist to the baked image):
     //  - mask cloud-init's later stages: only the local stage matters
     //    (runcmd); main regenerates the ssh host keys on EVERY boot
@@ -1020,7 +1057,7 @@ fn guestfish_run(image: &std::path::Path, cmds: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::user_data;
+    use super::{user_data, AGENT_SERVICE, AGENT_START_TIMER, NET_SCRIPT};
 
     /// The generated user-data must stay valid YAML: each runcmd entry is
     /// a multi-line plain scalar (one `bash -c '...'` per entry) with no
@@ -1041,6 +1078,42 @@ mod tests {
             assert!(!e.contains(" #"), "runcmd entry contains ' #' (starts a comment, breaks the YAML plain scalar): {}", e.chars().take(80).collect::<String>());
             assert_eq!(e.matches('\'').count(), 2, "unbalanced single quotes: {}", e.chars().take(80).collect::<String>());
         }
+    }
+
+    /// The net-fallback script is baked into the image and runs on every
+    /// boot — a shell syntax error would brick networking on all VMs.
+    #[test]
+    fn net_script_is_valid_shell() {
+        use std::io::Write;
+        let mut child = std::process::Command::new("bash")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn bash");
+        {
+            let mut si = child.stdin.take().expect("stdin");
+            si.write_all(NET_SCRIPT.as_bytes()).expect("write");
+        }
+        let o = child.wait_with_output().expect("wait");
+        assert!(o.status.success(), "bash -n failed on NET_SCRIPT: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// The agent units must be parseable systemd units (basic shape check:
+    /// sections, no empty lines in the wrong place, the ExecStart quoting
+    /// is balanced).
+    #[test]
+    fn agent_units_shape() {
+        for (name, u) in [("pi-vm-agent.service", AGENT_SERVICE), ("pi-vm-agent-start.timer", AGENT_START_TIMER)] {
+            assert!(u.contains("[Unit]"), "missing [Unit] section in {name}");
+            assert!(u.matches('\'').count() % 2 == 0, "unbalanced single quotes in {name}");
+            assert!(u.matches('"').count() % 2 == 0, "unbalanced double quotes in {name}");
+        }
+        assert!(AGENT_SERVICE.contains("RemainAfterExit=no"), "the starter must stay re-triggerable across ticks");
+        assert!(AGENT_SERVICE.contains("test -x /usr/local/bin/pi-vm-launch.sh"), "must guard on the script existing");
+        assert!(AGENT_SERVICE.contains("PI_VM_SERVICE=1"), "the session must set PI_VM_SERVICE (poweroff on exit)");
+        assert!(AGENT_START_TIMER.contains("OnUnitActiveSec=1s"));
     }
 }
 

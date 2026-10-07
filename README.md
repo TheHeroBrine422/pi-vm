@@ -39,14 +39,35 @@ pi-vm bake [--pi-dir D] [--timeout N]
                          build-time COPY
 pi-vm create [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
               [--extra-disk N] [--kvm on|off] [--squash-uid U] [--no-mount]
-              [--console] [--shell]
+              [--console] [--shell] [--prompt-file F] [--session-dir D]
+              [--timeout N]
                          new VM from the pre-baked base (no path, or
                          --no-mount, = no shared mount: no virtiofsd, no
                          /workspace in the guest); boots and (if the
                          terminal is interactive) attaches an ssh session
                          that starts in pi (cd /workspace; pi)
-pi-vm resume <id|name> [--console] [--shell]
-                         boot an existing VM and attach
+                         --prompt-file F: F's CONTENT is delivered to the
+                         guest via the seed ISO and passed to pi as its
+                         first message (pi stays interactive — the session
+                         can be steered with `pi-vm send`); the guest runs
+                         pi in a tmux session 'agent' (attach lands in it)
+                         and powers the VM off when pi exits
+                         --session-dir D: pi's session dir (a path inside
+                         the shared project maps to /workspace/<rel>; an
+                         absolute path is used as a guest path)
+                         --timeout N: stop the VM N seconds after launch
+                         (boot time counts against it)
+pi-vm resume <id|name> [--console] [--shell] [--prompt-file F]
+           [--session-dir D] [--timeout N]
+                         boot an existing VM and attach; the seed ISO is
+                         regenerated on every boot, so a resume can
+                         re-deliver (or reset — omit the flags) the agent
+                         launch assets
+pi-vm send <id|name> -m MSG
+                         type MSG into the running VM's agent (the tmux
+                         session 'agent' — agent VMs only); a newline in
+                         MSG becomes a space (a pty newline would submit
+                         early)
 pi-vm list [-v]         all VMs (docker ps -a style; alias: pi-vm ls)
 pi-vm inspect <id|name> full metadata (meta.json + paths)
 pi-vm logs <id|name> [-f] [-n N]
@@ -88,6 +109,14 @@ pi-vm version           CLI + CH versions, image hashes
   the agent (exiting the shell stops the VM). The disk persists —
   `pi-vm resume` reboots it. Need the VM to outlive your terminal? Run
   `pi-vm` inside tmux.
+- **Agent VMs** — `create`/`resume` with `--prompt-file`/`--session-dir`
+  deliver the launch script + prompt through the per-boot seed ISO (the
+  cloud-init runcmd installs them on first boots; the baked
+  cloud-init-independent net-fallback loop installs — or RESETS, when no
+  script is delivered — them on every boot, since the disk persists). A
+  1 s timer starts the detached tmux session 'agent' that runs pi with
+  the prompt; interactive attaches land in that session, `pi-vm send`
+  types into it, and the VM powers itself off when pi exits.
 - **Ownership** — files the agent writes in the guest land on the host
   owned by you: virtiofsd squashes every guest uid to one host uid
   (default: the owner of the shared project dir; for `--no-mount` VMs,
@@ -177,6 +206,8 @@ pi-vm version           CLI + CH versions, image hashes
 - include a hash of the prebaked image in the vm metadata so you can know if the vm is based on the most recent baked image
 - possibly keep older versions of the baked image and add a `pi-vm images` command?
 - codemode
+- maybe change this where you need to run it with sudo or similar to like the root access thing docker does since having sudo in the script is annoying cause if it times out you have to type in the password at the start and end of the session
+- CTRL+Z hangs the session. it seems to result in you disconnecting from the ssh, but also not able to stop the process with CTRL+C. its what made me need to run kill -9 in the past. running kill on the pid this time cleaned it up properly.
 - Later goals (not required for v1):
   - Block git write actions (make git read-only somehow)
   - Simplify subagents (fewer options for subagent types)
