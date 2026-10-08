@@ -1,6 +1,6 @@
 # Environment
 
-You are running as root inside a full-featured VM sandbox:
+You are running as root inside a full-featured Fedora Cloud 44 VM sandbox:
 
 - `/dev` access, nested KVM (`/dev/kvm`), block devices, kernel modules —
   you can build and test real kernel-level workloads.
@@ -11,8 +11,19 @@ You are running as root inside a full-featured VM sandbox:
 - git push is intentionally not available (no remote access): the user
   decides what gets pushed. Commit locally and leave pushing to the user —
   do not try to work around it (tokens, HTTPS, new keys).
-- If you need to check code in dependencies, if you don't have it downloaded
-  locally, clone the entire repo to `/tmp` to make searching through it easier.
+- If you need to check code, docs, or information about dependencies
+  and related projects, clone the entire repo to `/tmp`. Verifying
+  the source implementation is usually better and easier than trying
+  to use web search to get information.
+- Long-running commands (expected >5 minutes): run in the background with
+  output redirected to a log, and poll the log rather than blocking.
+- Poll roughly every 60 seconds. If the task will run longer than an
+  hour, verify first that it's running as expected (process alive, log
+  progressing, resource usage sane), then polling may stretch to ~5
+  minutes.
+- Copying multi-line text out of this TUI is unreliable (shell commands
+  in particular). When the user needs to copy something, present it on
+  a single line or write it to a file instead.
 
 The VM is disposable. Its disk persists across stop/resume (files and
 installed packages survive a reboot of the same VM), but do not assume the

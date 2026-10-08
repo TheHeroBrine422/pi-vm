@@ -161,10 +161,8 @@ pi-vm version           CLI + CH versions, image hashes
 ## TODO
 
 - Separate VM work trees via CoW
-- A better solution for long-running commands (the LLM loses control until
-  the command finishes, which is bad if a task has a problem halfway
-  through)
-  - this is also an issue for long running autonoumus sessions. a command hung for 2-3h and the LLM had no way of dealing with it. I think a hardcap on timeout and maybe an instruction to do background tasks for long tasks and check output?
+- a better solution for syncing pi directory
+- better filters/sorting for ls
 - disable git safe.directory entirely
 - pi-vm attach command to attach a shell to a running vm
 - --rm flag, and maybe a shortcut for --no-mount for just asking quick questions
@@ -180,8 +178,9 @@ pi-vm version           CLI + CH versions, image hashes
 - codemode
 - maybe change this where you need to run it with sudo or similar to like the root access thing docker does since having sudo in the script is annoying cause if it times out you have to type in the password at the start and end of the session
 - CTRL+Z hangs the session. it seems to result in you disconnecting from the ssh, but also not able to stop the process with CTRL+C. its what made me need to run kill -9 in the past. running kill on the pid this time cleaned it up properly.
+- possibly change "create" to be the default command since I use it so much
+- better tailscale aperture support. need to auto include the /etc/hosts file and figure out a better networking solution
 - Later goals (not required for v1):
-  - Block git write actions (make git read-only somehow)
   - Simplify subagents (fewer options for subagent types)
     - might also be a good idea to add a note to the AGENTS.md file to use subagents in cases where it is doing multiple large tasks that can be done in parallel
     - it would be cool for there to be a good way for it to spin up subagents in a separate VM
