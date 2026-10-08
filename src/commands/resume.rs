@@ -29,7 +29,7 @@ impl Resume {
                 return 2;
             }
         };
-        match boot(home, meta, attach, self.console, self.shell) {
+        match boot(home, meta, attach, self.console, self.shell, None) {
             Ok(code) => code,
             Err(f) => {
                 eprintln!("error: {}", f.msg());

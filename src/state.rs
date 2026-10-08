@@ -267,23 +267,38 @@ pub fn allocate_subnet(home: &VmHome) -> Result<(String, String, String), String
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
-    for n in 2..=251u8 {
-        let subnet = format!("172.16.{n}.0/24");
-        if used.contains(&subnet) {
-            continue;
-        }
-        // v1's guard: skip N if either .1 or .2 is already on a live
-        // interface (a VM we don't know about, or a nested pi-vm's parent).
-        if live.contains(&format!("172.16.{n}.1/"))
-            || live.contains(&format!("172.16.{n}.2/"))
-        {
-            continue;
-        }
-        let ip = format!("172.16.{n}.2");
-        let mac = format!("52:54:00:00:00:{n:02x}");
-        return Ok((subnet, ip, mac));
+    let free: Vec<u8> = (2..=251)
+        .filter(|n| {
+            let subnet = format!("172.16.{n}.0/24");
+            !used.contains(&subnet)
+                && !live.contains(&format!("172.16.{n}.1/"))
+                && !live.contains(&format!("172.16.{n}.2/"))
+        })
+        .collect();
+    if free.is_empty() {
+        return Err("no free 172.16.N.0/24 subnet (N in 2..=251)".to_string());
     }
-    Err("no free 172.16.N.0/24 subnet (N in 2..=251)".to_string())
+    // RANDOM pick from the free set: sequential scanning made every concurrent
+    // `create` race for the same first-free N (duplicate subnets -> all VMs
+    // get .2 -> ssh unreachable). Random makes a collision ~1/250 per pair.
+    let n = free[rand_below(free.len())];
+    let ip = format!("172.16.{n}.2");
+    let mac = format!("52:54:00:00:00:{n:02x}");
+    Ok((format!("172.16.{n}.0/24"), ip, mac))
+}
+
+fn rand_below(len: usize) -> usize {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut buf).is_ok() {
+            return (u64::from_ne_bytes(buf) % len as u64) as usize;
+        }
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as usize % len)
+        .unwrap_or(0)
 }
 
 /// Current unix timestamp in seconds.
