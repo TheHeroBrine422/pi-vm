@@ -17,7 +17,8 @@ docs/       forwarding.md (reaching private/remote services from a VM)
 ## Install / Setup
 
 Requirements:
-- dnf based system (fedora)
+- a dnf-based (Fedora/CachyOS) or apt-based (Ubuntu/Debian) host —
+  `pi-vm install` detects the package manager and maps package names
 - rust toolchain installed
 
 ```
@@ -68,6 +69,10 @@ pi-vm send <id|name> -m MSG
                          session 'agent' — agent VMs only); a newline in
                          MSG becomes a space (a pty newline would submit
                          early)
+pi-vm fetch <id|name> <guest-path> <host-path>
+                         copy a file or directory from a running VM to
+                         the host (scp -r) — e.g. host-side snapshots
+                         of the agent's pi session dir
 pi-vm list [-v]         all VMs (docker ps -a style; alias: pi-vm ls)
 pi-vm inspect <id|name> full metadata (meta.json + paths)
 pi-vm logs <id|name> [-f] [-n N]

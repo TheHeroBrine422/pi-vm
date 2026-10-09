@@ -3,6 +3,7 @@
 
 pub mod create;
 pub mod doctor;
+pub mod fetch;
 pub mod inspect;
 pub mod install;
 pub mod list;
@@ -36,6 +37,8 @@ pub enum Cmd {
     Resume(resume::Resume),
     /// Type a message into a running VM's agent (tmux session 'agent')
     Send(send::Send),
+    /// Copy a file or directory from a running VM to the host
+    Fetch(fetch::Fetch),
     /// Install host prerequisites (packages, assets) and bake the base image
     Install(install::Install),
     /// Rebuild the pre-baked base image (pi config + toolchain)
@@ -55,6 +58,7 @@ impl Cmd {
             Cmd::Create(args) => args.run(home),
             Cmd::Resume(args) => args.run(home),
             Cmd::Send(args) => args.run(home),
+            Cmd::Fetch(args) => args.run(home),
             Cmd::Install(args) => args.run(home),
             Cmd::Bake(args) => args.run(home),
             Cmd::Logs(args) => args.run(home),
