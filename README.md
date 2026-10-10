@@ -82,7 +82,14 @@ pi-vm fetch <id|name> <guest-path> <host-path>
                          of the agent's pi session dir (pi's default
                          session dir is guest-local: /root/.pi/agent/
                          sessions/)
-pi-vm list [-v]         all VMs (docker ps -a style; alias: pi-vm ls)
+pi-vm list [-v] [--filter KEY=VALUE]... [--sort created|last-run|state|name|id]
+              [--reverse]
+                         all VMs (docker ps -a style; alias: pi-vm ls)
+                         --filter (repeatable, AND): state=running|stopped,
+                         name=<prefix>, project=<prefix>, id=<prefix>
+                         --sort: order the rows (state: running first;
+                         nameless first by name); --reverse flips the
+                         order; no --sort keeps the default order
 pi-vm inspect <id|name> full metadata (meta.json + paths)
 pi-vm logs <id|name> [-f] [-n N]
                          VM console log (follow with -f)
@@ -235,7 +242,6 @@ pi-vm version           CLI + CH versions, image hashes
 - Separate VM work trees via CoW
 - a better solution for syncing pi directory
 - better ways to deal with long lasting commands. we likely need to see if pi can force commands to have a max timeout of lets say 10 minutes and never let the LLM do a timeout higher then that. maybe even 5 minutes tbh
-- better filters/sorting for ls
 - disable git safe.directory entirely
 - maybe a shortcut for --no-mount for just asking quick questions
 - fix bug where all qcow's ref tables are being rebuilt on every create even after a valid build
