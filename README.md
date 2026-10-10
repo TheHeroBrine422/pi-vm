@@ -165,6 +165,11 @@ pi-vm version           CLI + CH versions, image hashes
   the VM down the same graceful way. `kill -9` no longer orphans the VM
   either: every child carries PR_SET_PDEATHSIG, so a dead supervisor
   SIGTERMs CH (immediate host-side poweroff) + virtiofsd + the ssh client.
+- **What does Ctrl-Z do?** It is caught and ignored (you get a one-line
+  hint): pi-vm does not suspend, so the VM and the attached ssh session
+  stay up (the children ignore SIGTSTP too). Stop the VM by exiting the
+  guest session — Ctrl-C while attached goes to the remote session, as
+  usual; while booting or in a non-interactive run, Ctrl-C stops the VM.
 - **Why does ssh take a while to come up?** The baked `pi-vm-net` unit
   runs a convergence loop (up to 60 s) that brings up the network + ssh as
   soon as the underlying devices are ready, in parallel with sshd, and
@@ -221,7 +226,6 @@ pi-vm version           CLI + CH versions, image hashes
 - possibly keep older versions of the baked image and add a `pi-vm images` command?
 - codemode
 - maybe change this where you need to run it with sudo or similar to like the root access thing docker does since having sudo in the script is annoying cause if it times out you have to type in the password at the start and end of the session
-- CTRL+Z hangs the session. it seems to result in you disconnecting from the ssh, but also not able to stop the process with CTRL+C. its what made me need to run kill -9 in the past. running kill on the pid this time cleaned it up properly.
 - possibly change "create" to be the default command since I use it so much
 - better tailscale aperture support. need to auto include the /etc/hosts file and figure out a better networking solution
 - Later goals (not required for v1):

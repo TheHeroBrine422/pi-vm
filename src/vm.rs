@@ -534,10 +534,15 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
 
     // Signal handling: Ctrl-C (SIGINT) and SIGTERM set separate flags.
     // Ctrl-C interrupts the boot-wait only (while attached it goes to the
-    // remote session); SIGTERM tears down in every state.
+    // remote session); SIGTERM tears down in every state. Ctrl-Z (SIGTSTP)
+    // sets a flag the wait loops turn into a one-line hint — the default
+    // suspend action is replaced, so Ctrl-Z no longer hangs the session
+    // (the children ignore SIGTSTP themselves — see child_pdeathsig —
+    // because the terminal sends it to the whole foreground group).
     let interrupted = Arc::new(AtomicBool::new(false));
     let terminated = Arc::new(AtomicBool::new(false));
-    install_signal_handler(interrupted.clone(), terminated.clone());
+    let tstp = Arc::new(AtomicBool::new(false));
+    install_signal_handler(interrupted.clone(), terminated.clone(), tstp.clone());
 
     // --- wait for ssh ---
     let boot_deadline = 300;
@@ -549,6 +554,9 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
         waited += 2;
         if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
             break;
+        }
+        if tstp.swap(false, Ordering::Relaxed) {
+            eprintln!("{SIGTSTP_HINT}");
         }
         if ch_child.try_wait().ok().flatten().is_some() {
             teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock);
@@ -690,6 +698,9 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
                 1
             }
             Ok(mut ssh) => loop {
+                if tstp.swap(false, Ordering::Relaxed) {
+                    eprintln!("{SIGTSTP_HINT}");
+                }
                 let timed_out = deadline
                     .map(|d| std::time::Instant::now() >= d)
                     .unwrap_or(false);
@@ -718,6 +729,9 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             thread::sleep(Duration::from_secs(1));
             if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
                 break;
+            }
+            if tstp.swap(false, Ordering::Relaxed) {
+                eprintln!("{SIGTSTP_HINT}");
             }
             if deadline.map(|d| std::time::Instant::now() >= d).unwrap_or(false) {
                 eprintln!("timeout — stopping the VM");
@@ -857,17 +871,23 @@ fn set_pdeathsig() {}
 /// poweroff), virtiofsd exits (its forked daemon carries its own
 /// PR_SET_PDEATHSIG, so killing the parent kills both), the ssh client
 /// exits (the remote session ends). This is what prevents `kill -9 pi-vm`
-/// from orphaning the VM.
+/// from orphaning the VM. It also sets SIGTSTP=SIG_IGN: a terminal Ctrl-Z
+/// signals the whole foreground process group, and with the default action
+/// the children (ssh, CH, virtiofsd) would stop — freezing the attached
+/// session even though pi-vm catches the signal (the SIG_IGN disposition is
+/// inherited across exec).
 fn child_pdeathsig() -> std::io::Result<()> {
     #[cfg(unix)]
     unsafe extern "C" {
         fn prctl(option: i32, arg2: i32) -> i32;
+        fn signal(signum: i32, handler: usize) -> usize;
     }
     #[cfg(unix)]
     unsafe {
         if prctl(1, 15) != 0 {
             return Err(std::io::Error::last_os_error());
         }
+        signal(signal_hook::consts::SIGTSTP, 1); // SIG_IGN
     }
     Ok(())
 }
@@ -950,7 +970,6 @@ fn tail_file(p: &std::path::Path, n: usize) {
     }
 }
 
-/// Install SIGINT/SIGTERM handlers that set the flag (signal-hook::flag).
 /// True if the qcow2 was cleanly closed (per `qemu-img info`). On any
 /// failure (qemu-img missing, unreadable file) assume it is fine so a
 /// diagnostic hiccup never blocks the boot.
@@ -968,12 +987,19 @@ fn qemu_img_info_cleanly_closed(out: &str) -> bool {
     !out.contains("cleanly shut down: no")
 }
 
+/// The one-line hint printed when Ctrl-Z (SIGTSTP) arrives: the signal is
+/// caught instead of suspending the process, so the session keeps running.
+const SIGTSTP_HINT: &str = "Ctrl-Z ignored while attached — the VM stays up; use Ctrl-C or exit the guest session to stop it";
+
 /// SIGINT (Ctrl-C) and SIGTERM set separate flags: Ctrl-C only interrupts
 /// the boot-wait (while attached it goes to the remote session); SIGTERM
-/// tears down in every state.
-fn install_signal_handler(interrupted: Arc<AtomicBool>, terminated: Arc<AtomicBool>) {
+/// tears down in every state. SIGTSTP (Ctrl-Z) sets a flag the wait loops
+/// turn into the hint — the default suspend action is replaced, so Ctrl-Z
+/// no longer hangs the session.
+fn install_signal_handler(interrupted: Arc<AtomicBool>, terminated: Arc<AtomicBool>, tstp: Arc<AtomicBool>) {
     let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted);
     let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, terminated);
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGTSTP, tstp);
 }
 
 /// The cloud-init runcmd (ported from v1 start.sh — the pre-baked
@@ -1081,6 +1107,10 @@ fi",
 mod tests {
     use super::{qemu_img_info_cleanly_closed, user_data};
     use crate::state::{VmMeta, VmState};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     fn test_meta() -> VmMeta {
         VmMeta {
@@ -1142,6 +1172,48 @@ mod tests {
         // dirty: the "cleanly shut down: no" line is present
         assert!(!qemu_img_info_cleanly_closed(
             "image: disk.qcow2\nfile format: qcow2\nvirtual size: 80 GiB (85899345920 bytes)\ndisk size: 1.2 GiB\ncleanly shut down: no\n"));
+    }
+
+    /// Ctrl-Z must not suspend the process: with the SIGTSTP flag
+    /// registered, a SIGTSTP to the test process sets the flag and the
+    /// process keeps running (a regression would stop the process and
+    /// hang this test).
+    #[test]
+    fn sigtstp_is_caught_not_suspended() {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let terminated = Arc::new(AtomicBool::new(false));
+        let tstp = Arc::new(AtomicBool::new(false));
+        super::install_signal_handler(interrupted, terminated, tstp.clone());
+        super::libc_kill(std::process::id(), 20); // SIGTSTP
+        thread::sleep(Duration::from_millis(300));
+        assert!(tstp.load(Ordering::Relaxed), "SIGTSTP flag not set");
+        // reaching here = the process was not suspended
+    }
+
+    /// A child that applied child_pdeathsig (the pre_exec hook) must NOT
+    /// stop on SIGTSTP: the children share pi-vm's process group, so a
+    /// terminal Ctrl-Z reaches them too; the attach flow relies on them
+    /// ignoring it (ssh/CH/virtiofsd keep running).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn children_ignore_sigtstp() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        unsafe {
+            cmd.pre_exec(|| super::child_pdeathsig());
+        }
+        let mut child = cmd.spawn().expect("spawn sleep");
+        thread::sleep(Duration::from_millis(300));
+        super::libc_kill(child.id(), 20); // SIGTSTP
+        thread::sleep(Duration::from_millis(300));
+        // a stopped process shows state 'T' in /proc/<pid>/stat
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.id()))
+            .expect("read /proc stat");
+        let state = stat.rsplit(')').nth(1).expect("stat state field").chars().next().expect("state char");
+        assert_ne!(state, 'T', "child stopped on SIGTSTP");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
