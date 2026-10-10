@@ -18,7 +18,7 @@ pub struct Resume {
     #[arg(long)]
     pub shell: bool,
     /// Re-copy the agent prompt into <project>/prompt.txt (the seed of the
-    /// agent VM — the guest timer starts pi with it; a hand-placed
+    /// agent VM — the supervisor starts pi with it; a hand-placed
     /// prompt.txt also makes the VM an agent VM)
     #[arg(long)]
     pub prompt_file: Option<String>,

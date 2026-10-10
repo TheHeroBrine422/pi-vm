@@ -48,11 +48,15 @@ impl Attach {
         // Same signal model as the boot attach in vm.rs: Ctrl-C (SIGINT)
         // is registered but deliberately NOT checked — the terminal
         // delivers it to the foreground group and ssh forwards it to the
-        // remote session. SIGTERM ends the ssh session.
+        // remote session. SIGTERM ends the ssh session. Ctrl-Z (SIGTSTP)
+        // is registered (hint only) so this process does not suspend;
+        // the ssh child ignores SIGTSTP itself (with_pdeathsig).
         let interrupted = Arc::new(AtomicBool::new(false));
         let terminated = Arc::new(AtomicBool::new(false));
+        let tstp = Arc::new(AtomicBool::new(false));
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted.clone());
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, terminated.clone());
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGTSTP, tstp.clone());
 
         let key = meta.ssh_key_path(home);
         let mut ssh = std::process::Command::new("ssh");
@@ -84,6 +88,9 @@ impl Attach {
             // ssh session even while attached (a blocking status() would
             // make `kill <attach-pid>` a no-op).
             Ok(mut child) => loop {
+                if tstp.swap(false, Ordering::Relaxed) {
+                    eprintln!("Ctrl-Z ignored while attached — the VM stays up; exit the shell (or Ctrl-C) to end the attach");
+                }
                 if terminated.load(Ordering::Relaxed) {
                     crate::vm::libc_kill(child.id(), 15);
                 }

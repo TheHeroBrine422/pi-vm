@@ -8,6 +8,13 @@ use clap::Args;
 
 use crate::state::{resolve, VmHome, VmState};
 
+/// Escape a string for embedding in a single-quoted shell argument.
+/// Inside single quotes backslashes are literal, so only `'` needs
+/// escaping (close the quote, an escaped quote, reopen the quote).
+fn escape_single_quoted(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
+
 #[derive(Args)]
 pub struct Send {
     /// VM id, unique id prefix, or name
@@ -38,8 +45,10 @@ impl Send {
         }
         // Sanitize: a newline in pty input is an Enter (early submit).
         let msg = self.message.replace('\n', " ").replace('\r', " ");
-        // Escape for the remote shell (single-quote context).
-        let q = msg.replace('\\', "\\\\").replace('\'', "'\\''");
+        // Escape for the remote shell (single-quote context): inside
+        // single quotes backslashes are LITERAL, so only the quote
+        // itself needs escaping.
+        let q = escape_single_quoted(&msg);
         let cmd = format!("tmux send-keys -t agent '{q}' Enter");
         let key = meta.ssh_key_path(home);
         let o = std::process::Command::new("ssh")
@@ -72,5 +81,34 @@ impl Send {
                 1
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_single_quoted;
+
+    #[test]
+    fn backslashes_are_literal_not_doubled() {
+        // P1 regression: a backslash must be typed as a single backslash
+        // (the old code doubled it inside the single-quote context).
+        assert_eq!(escape_single_quoted("C:\\temp\\x"), "C:\\temp\\x");
+    }
+
+    #[test]
+    fn quotes_are_escaped() {
+        assert_eq!(escape_single_quoted("it's"), "it'\\''s");
+        assert_eq!(escape_single_quoted("a'b'c"), "a'\\''b'\\''c");
+    }
+
+    #[test]
+    fn mixed_backslash_and_quote() {
+        // backslash stays single; quote gets the close/escape/reopen.
+        assert_eq!(escape_single_quoted("a\\'b"), "a\\'\\''b");
+    }
+
+    #[test]
+    fn plain_text_unchanged() {
+        assert_eq!(escape_single_quoted("hello world /quit"), "hello world /quit");
     }
 }

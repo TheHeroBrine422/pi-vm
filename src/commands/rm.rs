@@ -69,6 +69,8 @@ pub fn delete_vm(home: &VmHome, meta: &crate::state::VmMeta, force: bool) -> i32
         &std::fs::read_to_string(meta.meta_path(home)).unwrap_or_else(|_| "{}".into()),
     )
     .unwrap_or(meta.clone());
+    // Pre-acquired lock from the force-kill polling loop below.
+    let mut pre_lock: Option<crate::state::VmLock> = None;
     if raw.state == VmState::Running {
         // Reconcile: a "running" record whose supervisor pid is dead
         // (host reboot, kill -9 of the supervisor) is just a record of
@@ -105,15 +107,39 @@ pub fn delete_vm(home: &VmHome, meta: &crate::state::VmMeta, force: bool) -> i32
                     let _ = std::process::Command::new("kill").arg(line.trim()).output();
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            // The flock is held by the SUPERVISOR process (not the killed
+            // CH); its own teardown (guest poweroff attempt, network
+            // cleanup, meta save) takes a few seconds. Poll for the lock
+            // instead of guessing with a fixed sleep (P1: the old 2 s
+            // sleep raced the supervisor and made --force flakily fail
+            // with 'in use').
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match crate::state::VmLock::acquire(meta, home) {
+                    Ok(l) => {
+                        pre_lock = Some(l);
+                        break;
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return 1;
+                    }
+                }
+            }
         }
     }
-    let _lock = match crate::state::VmLock::acquire(meta, home) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
-        }
+    let _lock = match pre_lock.take() {
+        Some(l) => l,
+        None => match crate::state::VmLock::acquire(meta, home) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        },
     };
     crate::state::cleanup_network(meta);
     match crate::state::remove_vm(meta, home) {

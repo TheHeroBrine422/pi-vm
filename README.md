@@ -31,7 +31,8 @@ pi-vm bake
 
 `pi-vm <path>` is shorthand for `pi-vm create <path>` — `create` is the
 default subcommand: any bare first positional that is not a subcommand
-name creates a VM (e.g. `pi-vm /tmp/proj`).
+name creates a VM (e.g. `pi-vm /tmp/proj`). A path that collides with a
+subcommand name (e.g. a dir named `list`) must be given as `./list`.
 
 ```
 pi-vm install [--check]   one-time host setup: packages, CH +
@@ -237,8 +238,6 @@ pi-vm version           CLI + CH versions, image hashes
   creation in the mount can fail with `Unknown system error -116`
   (ENOKEY) — observed on pi session-file creation. Workaround: put the
   shared folder on the VM's local disk (e.g. /tmp) for nested use.
-  (The prompt-run's `mkdir -p` + manager-side retry-on-fast-abnormal-exit
-  paper over the transient cases.)
 - virtiofsd lives in `/usr/libexec` on Fedora (not in PATH).
 - The guest's root partition/fs grow to `--disk` on first boot via the
   cloud image's growpart/resizefs (the base is 5G virtual).
@@ -288,8 +287,8 @@ truth for "in use".
 | code | meaning |
 |---|---|
 | 0 | success |
-| 1 | generic error / not-found (rm/inspect/logs bad target) |
-| 2 | usage / preflight (missing image, no KVM, name collision, network; resume bad target) |
+| 1 | generic error (incl. attach/send/fetch: VM not running) |
+| 2 | usage / preflight / not-found (rm/inspect/logs bad target; missing image, no KVM, name collision, network; resume bad target) |
 | 3 | VM failed to boot (CH exited during boot) / bake verification failed |
 | 4 | ssh did not become reachable within the timeout |
 | 5 | VM is in use by another pi-vm process |

@@ -120,7 +120,7 @@ impl Doctor {
             ok: cloud.exists(),
             detail: if cloud.exists() {
                 if detailed {
-                    format!("present — sha256 {}", sha256_of(&cloud).unwrap_or_else(|| "?".into()))
+                    format!("present — sha256 {}", crate::util::sha256_file(&cloud).unwrap_or_else(|| "?".into()))
                 } else {
                     "present".into()
                 }
@@ -199,10 +199,3 @@ impl Doctor {
     }
 }
 
-fn sha256_of(p: &Path) -> Option<String> {
-    let data = std::fs::read(p).ok()?;
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(&data);
-    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
-}

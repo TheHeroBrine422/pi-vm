@@ -289,8 +289,9 @@ fn attach_title_prefix(meta: &VmMeta) -> Option<String> {
 }
 
 /// Boot the VM and (if attach) drop into ssh. Returns the exit code.
-/// `agent_mode`: the shared project carries a prompt.txt — the guest's
-/// timer starts the tmux session 'agent' (pi with the prompt), and
+/// `agent_mode`: the shared project carries a prompt.txt — the pi-vm
+/// supervisor starts the tmux session 'agent' (pi with the prompt) over
+/// ssh, and
 /// attaches land in it. `timeout_s`: stop the VM N seconds after launch
 /// (the deadline starts now; boot time counts against it — pass a budget
 /// with a boot buffer). `rm`: the caller will auto-delete the VM after a
@@ -746,18 +747,23 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
                 eprintln!("ssh attach failed: {e} — the VM is still running; reconnect with `pi-vm resume {}`", meta.id);
                 1
             }
-            Ok(mut ssh) => loop {
+            Ok(mut ssh) => {
+                let mut stop_announced = false;
+                loop {
                 if tstp.swap(false, Ordering::Relaxed) {
                     eprintln!("{SIGTSTP_HINT}");
                 }
                 let timed_out = deadline
                     .map(|d| std::time::Instant::now() >= d)
                     .unwrap_or(false);
-                if timed_out && !terminated.load(Ordering::Relaxed) {
-                    eprintln!("timeout — stopping the VM");
-                }
                 if terminated.load(Ordering::Relaxed) || timed_out {
-                    eprintln!("stopping the ssh session and the VM");
+                    if !stop_announced {
+                        if timed_out {
+                            eprintln!("timeout — stopping the VM");
+                        }
+                        eprintln!("stopping the ssh session and the VM");
+                        stop_announced = true;
+                    }
                     libc_kill(ssh.id(), 15);
                 }
                 match ssh.try_wait() {
@@ -767,6 +773,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
                         eprintln!("ssh attach failed: {e} — the VM is still running; reconnect with `pi-vm resume {}`", meta.id);
                         break 1;
                     }
+                }
                 }
             },
         }
