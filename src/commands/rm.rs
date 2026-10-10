@@ -121,6 +121,7 @@ mod tests {
             extra_disk: false,
             kvm: false,
             squash_uid: 1000,
+            base_image_sha256: None,
             state: VmState::Stopped,
             ch_pid: None,
         };

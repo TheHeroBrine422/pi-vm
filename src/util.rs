@@ -67,6 +67,25 @@ pub fn virtiofsd_path() -> Option<String> {
     libexec.exists().then(|| libexec.to_string_lossy().to_string())
 }
 
+/// Streaming sha256 of a file (lowercase hex). Reads in 1 MiB chunks —
+/// the pre-baked base image is ~2 GiB, so the whole file must not be
+/// loaded into memory. None if the file cannot be read.
+pub fn sha256_file(path: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Human-readable byte size.
 pub fn human(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -102,4 +121,26 @@ pub fn run_ok(cmd: &str, args: &[&str]) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256_file;
+
+    #[test]
+    fn sha256_file_known_vector() {
+        let p = std::env::temp_dir().join(format!("pi-vm-sha-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::write(&p, b"abc").unwrap();
+        // NIST test vector: sha256("abc")
+        assert_eq!(
+            sha256_file(&p).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sha256_file_missing_is_none() {
+        assert_eq!(sha256_file(std::path::Path::new("/nonexistent/pi-vm-sha-file")), None);
+    }
 }

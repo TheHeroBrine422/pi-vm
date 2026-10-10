@@ -137,6 +137,9 @@ pi-vm version           CLI + CH versions, image hashes
   python3, cargo/rust, uv, docker + compose, latest pi + pi-web-access +
   pi-subagents + pi-goal-x) + the direct-boot kernel assets. New VMs boot ready — no
   first-boot install. Re-run `pi-vm bake` after changing the pi config.
+  Each new VM records the base image's sha256 in meta.json (shown by
+  `pi-vm inspect`), so you can tell whether it is based on the most
+  recent bake (compare against `pi-vm version`).
 - **Direct kernel boot** — no UEFI, no GRUB: CH loads the kernel +
   initramfs straight from the baked assets (~5–8 s faster than a firmware
   boot). The console is a virtio-console (`hvc0`); `pi-vm logs` shows the
@@ -222,7 +225,6 @@ pi-vm version           CLI + CH versions, image hashes
 - terminal tab name based on vm id and mounted project directory
 - have install check for cloud-hypervisor binaries on PATH and other assets before downloading to have better compatibility with other install methods (ex: rpm spec)
   - related: make install not reliant on dnf.
-- include a hash of the prebaked image in the vm metadata so you can know if the vm is based on the most recent baked image
 - possibly keep older versions of the baked image and add a `pi-vm images` command?
 - codemode
 - maybe change this where you need to run it with sudo or similar to like the root access thing docker does since having sudo in the script is annoying cause if it times out you have to type in the password at the start and end of the session

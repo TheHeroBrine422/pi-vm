@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::util::{run, run_ok, run_ok_priv, run_priv, runcmd_block, virtiofsd_path};
+use crate::util::{run, run_ok, run_ok_priv, run_priv, runcmd_block, sha256_file, virtiofsd_path};
 use crate::state::{self, VmHome, VmMeta, VmState};
 
 /// Failure classes with distinct exit codes (so the tool is scriptable).
@@ -96,6 +96,11 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
             prepped.display()
         ));
     }
+    // Record the base image's sha256 in the meta (so the user can tell
+    // whether the VM is based on the most recent bake — compare against
+    // `pi-vm version`). None only if the image is unreadable, in which
+    // case the `cp` below fails with a clear error anyway.
+    let base_image_sha256 = sha256_file(&prepped);
     // name uniqueness
     if let Some(name) = &cfg.name {
         for id in home.list_vm_ids() {
@@ -139,6 +144,7 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
         extra_disk: cfg.extra_disk > 0,
         kvm: cfg.kvm,
         squash_uid: squash,
+        base_image_sha256,
         state: VmState::Stopped,
         ch_pid: None,
     };
@@ -1128,6 +1134,7 @@ mod tests {
             extra_disk: true,
             kvm: true,
             squash_uid: 1000,
+            base_image_sha256: None,
             state: VmState::Stopped,
             ch_pid: None,
         }

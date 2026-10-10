@@ -1,6 +1,7 @@
 //! `pi-vm version` — CLI + asset versions and image hashes.
 
 use crate::state::VmHome;
+use crate::util::sha256_file;
 
 pub fn run(home: &VmHome) -> i32 {
     println!("pi-vm {}", env!("CARGO_PKG_VERSION"));
@@ -16,22 +17,15 @@ pub fn run(home: &VmHome) -> i32 {
         ("cloud image", home.cloud_image()),
         ("pre-baked image", home.prepped_image()),
     ] {
-        if p.exists() {
-            let h = std::fs::read(&p)
-                .ok()
-                .map(|d| {
-                    use sha2::{Digest, Sha256};
-                    let mut s = Sha256::new();
-                    s.update(&d);
-                    s.finalize()
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
-                })
-                .unwrap_or_default();
-            println!("{label} sha256 {h}");
-        } else {
-            println!("{label} (missing)");
+        match sha256_file(&p) {
+            Some(h) => println!("{label} sha256 {h}"),
+            None => {
+                if p.exists() {
+                    println!("{label} sha256 (unreadable)");
+                } else {
+                    println!("{label} (missing)");
+                }
+            }
         }
     }
     0

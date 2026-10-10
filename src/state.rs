@@ -136,6 +136,12 @@ pub struct VmMeta {
     pub kvm: bool,
     /// The uid all guest uids are squashed to (the ownership guarantee).
     pub squash_uid: u32,
+    /// sha256 of the pre-baked base image at creation time — lets the
+    /// user tell whether the VM is based on the most recent bake
+    /// (compare against `pi-vm version`). Old meta.json files lack the
+    /// field; serde deserializes it to None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_image_sha256: Option<String>,
     pub state: VmState,
     /// Set while a pi-vm process is supervising this VM (reconciled on load).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,6 +420,7 @@ mod tests {
             extra_disk: false,
             kvm: true,
             squash_uid: 1000,
+            base_image_sha256: None,
             state: VmState::Stopped,
             ch_pid: None,
         };
@@ -442,6 +449,7 @@ mod tests {
             extra_disk: true,
             kvm: false,
             squash_uid: 1000,
+            base_image_sha256: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
             state: VmState::Stopped,
             ch_pid: None,
         };
@@ -449,6 +457,47 @@ mod tests {
         let loaded = VmMeta::load(&home, &id).unwrap();
         assert_eq!(loaded.name.as_deref(), Some("test"));
         assert_eq!(loaded.subnet, "172.16.3.0/24");
+        assert_eq!(loaded.base_image_sha256.as_deref(), Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Backward compatibility: a meta.json written before the
+    /// base_image_sha256 field existed must still load (the field
+    /// deserializes to None).
+    #[test]
+    fn meta_without_base_image_sha256_loads() {
+        let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
+        let home = VmHome { root: dir.clone() };
+        let id = new_id();
+        let meta = VmMeta {
+            id: id.clone(),
+            name: None,
+            created: 0,
+            updated: 0,
+            project: Some("/tmp".into()),
+            subnet: "172.16.7.0/24".into(),
+            ip: "172.16.7.2".into(),
+            mac: "52:54:00:00:00:07".into(),
+            vcpus: 1,
+            memory_mb: 1024,
+            disk_gb: 80,
+            extra_disk: false,
+            kvm: true,
+            squash_uid: 1000,
+            base_image_sha256: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
+            state: VmState::Stopped,
+            ch_pid: None,
+        };
+        meta.save(&home).unwrap();
+        // simulate an old meta.json: drop the field from the saved JSON
+        let path = meta.meta_path(&home);
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut obj = v.as_object().unwrap().clone();
+        assert!(obj.remove("base_image_sha256").is_some());
+        std::fs::write(&path, serde_json::to_string(&obj).unwrap()).unwrap();
+        let loaded = VmMeta::load(&home, &id).unwrap();
+        assert_eq!(loaded.base_image_sha256, None);
+        assert_eq!(loaded.subnet, "172.16.7.0/24");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -472,6 +521,7 @@ mod tests {
             extra_disk: false,
             kvm: true,
             squash_uid: 1000,
+            base_image_sha256: None,
             state: VmState::Stopped,
             ch_pid: None,
         };
@@ -509,6 +559,7 @@ mod tests {
             extra_disk: false,
             kvm: true,
             squash_uid: 1000,
+            base_image_sha256: None,
             state: VmState::Stopped,
             ch_pid: None,
         };
