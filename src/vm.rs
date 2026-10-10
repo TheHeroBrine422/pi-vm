@@ -942,14 +942,14 @@ fn child_pdeathsig() -> std::io::Result<()> {
 /// Attach child_pdeathsig to a spawn. (pre_exec is Unix-only; the stub
 /// keeps non-Unix builds compiling — the tool itself is Linux-oriented.)
 #[cfg(unix)]
-fn with_pdeathsig(cmd: &mut Command) {
+pub fn with_pdeathsig(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     unsafe {
         cmd.pre_exec(|| child_pdeathsig());
     }
 }
 #[cfg(not(unix))]
-fn with_pdeathsig(_cmd: &mut Command) {}
+pub fn with_pdeathsig(_cmd: &mut Command) {}
 
 /// Send an arbitrary signal to a pid (Child::kill only sends SIGKILL).
 #[cfg(unix)]

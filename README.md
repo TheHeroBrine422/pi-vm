@@ -65,6 +65,10 @@ pi-vm send <id|name> -m MSG
                          session 'agent' — agent VMs only); a newline in
                          MSG becomes a space (a pty newline would submit
                          early)
+pi-vm attach <id|name>
+                         attach a plain shell to a running VM (not the
+                         pi session); the VM keeps running when you exit
+                         (the supervisor that booted it owns the VM)
 pi-vm fetch <id|name> <guest-path> <host-path>
                          copy a file or directory from a running VM to
                          the host (scp -r) — e.g. host-side snapshots
@@ -221,7 +225,6 @@ pi-vm version           CLI + CH versions, image hashes
 - better ways to deal with long lasting commands. we likely need to see if pi can force commands to have a max timeout of lets say 10 minutes and never let the LLM do a timeout higher then that. maybe even 5 minutes tbh
 - better filters/sorting for ls
 - disable git safe.directory entirely
-- pi-vm attach command to attach a shell to a running vm
 - --rm flag, and maybe a shortcut for --no-mount for just asking quick questions
 - fix bug where all qcow's ref tables are being rebuilt on every create even after a valid build
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually

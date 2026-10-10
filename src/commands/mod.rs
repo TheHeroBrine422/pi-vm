@@ -1,6 +1,7 @@
 //! One file per command; each exposes an `Args` struct (clap) with a `run`
 //! method. `Cmd` is the subcommand enum and the single dispatch point.
 
+pub mod attach;
 pub mod create;
 pub mod doctor;
 pub mod fetch;
@@ -37,6 +38,8 @@ pub enum Cmd {
     Resume(resume::Resume),
     /// Type a message into a running VM's agent (tmux session 'agent')
     Send(send::Send),
+    /// Attach a plain shell to a running VM (not the pi session); the VM keeps running after you exit
+    Attach(attach::Attach),
     /// Copy a file or directory from a running VM to the host
     Fetch(fetch::Fetch),
     /// Install host prerequisites (packages, assets) and bake the base image
@@ -58,6 +61,7 @@ impl Cmd {
             Cmd::Create(args) => args.run(home),
             Cmd::Resume(args) => args.run(home),
             Cmd::Send(args) => args.run(home),
+            Cmd::Attach(args) => args.run(home),
             Cmd::Fetch(args) => args.run(home),
             Cmd::Install(args) => args.run(home),
             Cmd::Bake(args) => args.run(home),
