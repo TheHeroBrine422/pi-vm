@@ -112,6 +112,11 @@ pi-vm version           CLI + CH versions, image hashes
   the agent (exiting the shell stops the VM). The disk persists —
   `pi-vm resume` reboots it. Need the VM to outlive your terminal? Run
   `pi-vm` inside tmux.
+- **Terminal tab name** — an interactive attach sets the terminal tab
+  name to `pi-vm <first-8-of-id> <project-basename>` (the basename is
+  omitted for `--no-mount` VMs) via an OSC escape sequence sent to the
+  terminal before the session command runs (only when stdout is a tty —
+  piped output is left untouched).
 - **Agent VMs** — `<project>/prompt.txt` is the trigger: the pi-vm
   supervisor starts the detached tmux session 'agent' (over ssh, right
   after ssh-ready — the ssh session context can read the virtiofs
@@ -222,7 +227,6 @@ pi-vm version           CLI + CH versions, image hashes
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually
 - fix git signatures failing for commits inside the sandbox
 - ability to set extensions to be baked into the image as a setting for pi-vm rather then it being hard coded
-- terminal tab name based on vm id and mounted project directory
 - have install check for cloud-hypervisor binaries on PATH and other assets before downloading to have better compatibility with other install methods (ex: rpm spec)
   - related: make install not reliant on dnf.
 - possibly keep older versions of the baked image and add a `pi-vm images` command?

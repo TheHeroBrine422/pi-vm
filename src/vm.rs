@@ -18,7 +18,7 @@
 //! orphaning it. (PR_SET_PDEATHSIG on pi-vm itself does NOT do this — it
 //! only signals pi-vm when its parent, e.g. the shell, dies.)
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -251,6 +251,41 @@ pub fn direct_boot_args(home: &VmHome) -> Option<Vec<String>> {
         "--cmdline".into(),
         cmdline,
     ])
+}
+
+/// The terminal tab name for an attach session:
+/// `pi-vm <first-8-of-id> <project-basename>` (the basename is omitted
+/// for --no-mount VMs).
+fn attach_title(meta: &VmMeta) -> String {
+    let id8: String = meta.id.chars().take(8).collect();
+    let mut title = format!("pi-vm {id8}");
+    if let Some(p) = &meta.project {
+        if let Some(base) = std::path::Path::new(p)
+            .components()
+            .last()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .filter(|b| !b.is_empty())
+        {
+            title.push(' ');
+            title.push_str(&base);
+        }
+    }
+    title
+}
+
+/// The prefix for the attach command: sets the terminal tab name via an
+/// OSC escape sequence sent to the inherited stdout. Only when stdout is
+/// a tty — otherwise the sequence would leak into piped output (the
+/// attach decision itself is gated on stdin being a tty).
+fn attach_title_prefix(meta: &VmMeta) -> Option<String> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    // Pass the title as a printf argument (not as the format string) so
+    // a `%` or `\` in the basename is not interpreted; single quotes in
+    // the title are escaped for the shell.
+    let quoted = attach_title(meta).replace('\'', "'\\''");
+    Some(format!("printf '\\e]0;%s\\a' '{quoted}'; "))
 }
 
 /// Boot the VM and (if attach) drop into ssh. Returns the exit code.
@@ -685,6 +720,12 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
         } else {
             "cd /workspace; pi"
         };
+        // Set the terminal tab name before the session command runs
+        // (only when stdout is a tty).
+        let attach_cmd = match attach_title_prefix(&meta) {
+            Some(prefix) => format!("{prefix}{attach_cmd}"),
+            None => attach_cmd.to_string(),
+        };
         ssh.arg(attach_cmd);
         with_pdeathsig(&mut ssh);
         // Poll rather than block on status(): a SIGTERM to the supervisor
@@ -1111,7 +1152,7 @@ fi",
 
 #[cfg(test)]
 mod tests {
-    use super::{qemu_img_info_cleanly_closed, user_data};
+    use super::{attach_title, qemu_img_info_cleanly_closed, user_data};
     use crate::state::{VmMeta, VmState};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1221,6 +1262,21 @@ mod tests {
         assert_ne!(state, 'T', "child stopped on SIGTSTP");
         let _ = child.kill();
         let _ = child.wait();
+
+    }
+
+    #[test]
+    fn attach_title_uses_id_prefix_and_project_basename() {
+        let m = test_meta();
+        assert_eq!(attach_title(&m), "pi-vm testtest proj");
+    }
+
+    #[test]
+    fn attach_title_without_project_omits_basename() {
+        let mut m = test_meta();
+        m.project = None;
+        assert_eq!(attach_title(&m), "pi-vm testtest");
     }
 }
+
 
