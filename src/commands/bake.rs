@@ -525,7 +525,7 @@ echo "pi-vm baking toolchain...";
  echo "dnf3 rc=${{PIPESTATUS[0]}}") || true;
 (timeout 300 dnf install -y rust clippy 2>&1 | tail -2;
  echo "dnf4 rc=${{PIPESTATUS[0]}}") || true;
-(git config --global --replace-all safe.directory "*" 2>&1 | tail -1;
+(HOME=/root git config --global --replace-all safe.directory "*" 2>&1 | tail -1;
  echo "gitsafe rc=${{PIPESTATUS[0]}}") || true;
 (git config --system --replace-all commit.gpgsign false 2>&1 | tail -1;
  echo "gitgpg rc=${{PIPESTATUS[0]}}") || true;
@@ -1079,7 +1079,7 @@ mod tests {
     fn user_data_bakes_git_sandbox_config() {
         let s = user_data();
         assert!(
-            s.contains("git config --global --replace-all safe.directory \"*\""),
+            s.contains("HOME=/root git config --global --replace-all safe.directory \"*\""),
             "safe.directory must be disabled entirely in the baked image"
         );
         assert!(
