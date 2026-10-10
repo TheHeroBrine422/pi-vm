@@ -525,8 +525,10 @@ echo "pi-vm baking toolchain...";
  echo "dnf3 rc=${{PIPESTATUS[0]}}") || true;
 (timeout 300 dnf install -y rust clippy 2>&1 | tail -2;
  echo "dnf4 rc=${{PIPESTATUS[0]}}") || true;
-(git config --system --replace-all safe.directory /workspace 2>&1 | tail -1;
+(git config --global --replace-all safe.directory "*" 2>&1 | tail -1;
  echo "gitsafe rc=${{PIPESTATUS[0]}}") || true;
+(git config --system --replace-all commit.gpgsign false 2>&1 | tail -1;
+ echo "gitgpg rc=${{PIPESTATUS[0]}}") || true;
 (git config --system --replace-all user.name "Caleb Jones" 2>&1 | tail -1;
  git config --system --replace-all user.email "caleb@calebgj.io" 2>&1 | tail -1;
  echo "gitid rc=${{PIPESTATUS[0]}}") || true;
@@ -1067,6 +1069,23 @@ mod tests {
             assert!(!e.contains(" #"), "runcmd entry contains ' #' (starts a comment, breaks the YAML plain scalar): {}", e.chars().take(80).collect::<String>());
             assert_eq!(e.matches('\'').count(), 2, "unbalanced single quotes: {}", e.chars().take(80).collect::<String>());
         }
+    }
+
+    /// The baked runcmd must pre-configure git for sandbox use:
+    /// safe.directory disabled entirely (uid-squashed files must not
+    /// trigger 'dubious ownership') and GPG signing off (commits must not
+    /// attempt to sign — the guest has no gpg program).
+    #[test]
+    fn user_data_bakes_git_sandbox_config() {
+        let s = user_data();
+        assert!(
+            s.contains("git config --global --replace-all safe.directory \"*\""),
+            "safe.directory must be disabled entirely in the baked image"
+        );
+        assert!(
+            s.contains("git config --system --replace-all commit.gpgsign false"),
+            "commit.gpgsign must be off in the baked image"
+        );
     }
 
     /// The net-fallback script is baked into the image and runs on every

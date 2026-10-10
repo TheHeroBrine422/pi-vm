@@ -169,10 +169,13 @@ pi-vm version           CLI + CH versions, image hashes
   cloud + your pi config + the full toolchain (git, ripgrep, fd, node,
   python3, cargo/rust, uv, docker + compose, latest pi + pi-web-access +
   pi-subagents + pi-goal-x) + the direct-boot kernel assets. New VMs boot ready — no
-  first-boot install. Re-run `pi-vm bake` after changing the pi config.
-  Each new VM records the base image's sha256 in meta.json (shown by
-  `pi-vm inspect`), so you can tell whether it is based on the most
-  recent bake (compare against `pi-vm version`).
+  first-boot install. Git is pre-configured for sandbox use: safe.directory
+  is disabled entirely (uid-squashed files don't trigger 'dubious ownership')
+  and GPG signing is off (commits don't attempt to sign — the guest has no
+  gpg program), with a default user.name/email. Re-run `pi-vm bake` after
+  changing the pi config. Each new VM records the base image's sha256 in
+  meta.json (shown by `pi-vm inspect`), so you can tell whether it is based
+  on the most recent bake (compare against `pi-vm version`).
 - **Direct kernel boot** — no UEFI, no GRUB: CH loads the kernel +
   initramfs straight from the baked assets (~5–8 s faster than a firmware
   boot). The console is a virtio-console (`hvc0`); `pi-vm logs` shows the
@@ -246,11 +249,9 @@ pi-vm version           CLI + CH versions, image hashes
 - Separate VM work trees via CoW
 - a better solution for syncing pi directory
 - better ways to deal with long lasting commands. we likely need to see if pi can force commands to have a max timeout of lets say 10 minutes and never let the LLM do a timeout higher then that. maybe even 5 minutes tbh
-- disable git safe.directory entirely
 - maybe a shortcut for --no-mount for just asking quick questions
 - fix bug where all qcow's ref tables are being rebuilt on every create even after a valid build
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually
-- fix git signatures failing for commits inside the sandbox
 - ability to set extensions to be baked into the image as a setting for pi-vm rather then it being hard coded
 - have install check for cloud-hypervisor binaries on PATH and other assets before downloading to have better compatibility with other install methods (ex: rpm spec)
   - related: make install not reliant on dnf.
