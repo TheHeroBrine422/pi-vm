@@ -25,6 +25,12 @@ pub struct Resume {
     /// Stop the VM N seconds after launch
     #[arg(long)]
     pub timeout: Option<u64>,
+    /// Delete the VM (disk + state + network) when it stops normally
+    /// (the attach session ends, or --timeout fires) instead of leaving
+    /// it stopped. A failed boot does NOT delete it (investigate with
+    /// `pi-vm logs` / `pi-vm resume`).
+    #[arg(long)]
+    pub rm: bool,
 }
 
 impl Resume {
@@ -60,8 +66,23 @@ impl Resume {
                 .map(|p| std::path::Path::new(p).join("prompt.txt").exists())
                 .unwrap_or(false),
         };
-        match boot(home, meta, attach, self.console, self.shell, agent_mode, self.timeout) {
-            Ok(code) => code,
+        let rm_meta = meta.clone(); // for the --rm auto-delete after boot
+        match boot(home, meta, attach, self.console, self.shell, agent_mode, self.timeout, self.rm) {
+            Ok(code) => {
+                if self.rm {
+                    // Normal stop (attach session ended, or --timeout fired):
+                    // delete via the rm logic (lock is free — boot released
+                    // it). force=true: the teardown already killed the
+                    // children; the running-check is belt-and-braces.
+                    let name = rm_meta.name.as_deref().unwrap_or(&rm_meta.id);
+                    println!("==> --rm: deleting VM {name} (disk + state + network)");
+                    if crate::commands::rm::delete_vm(home, &rm_meta, true) != 0 {
+                        eprintln!("error: --rm auto-delete failed — VM {} still exists; delete it with `pi-vm rm {}`", rm_meta.id, rm_meta.id);
+                        return 1;
+                    }
+                }
+                code
+            }
             Err(f) => {
                 eprintln!("error: {}", f.msg());
                 f.code()

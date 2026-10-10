@@ -40,7 +40,7 @@ pi-vm bake [--pi-dir D] [--timeout N]
                          build-time COPY
 pi-vm create [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
               [--extra-disk N] [--kvm on|off] [--squash-uid U] [--no-mount]
-              [--console] [--shell] [--prompt-file F] [--timeout N]
+              [--console] [--shell] [--prompt-file F] [--timeout N] [--rm]
                          new VM from the pre-baked base (no path, or
                          --no-mount, = no shared mount: no virtiofsd, no
                          /workspace in the guest); boots and (if the
@@ -55,11 +55,18 @@ pi-vm create [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
                          makes the VM an agent VM.
                          --timeout N: stop the VM N seconds after launch
                          (boot time counts against it)
+                         --rm: when the VM stops normally (the attach
+                         session ends, or --timeout fires), delete it
+                         (disk + state + network) instead of leaving it
+                         stopped; a failed boot does not delete it
 pi-vm resume <id|name> [--console] [--shell] [--prompt-file F]
-           [--timeout N]
+           [--timeout N] [--rm]
                          boot an existing VM and attach; --prompt-file
                          re-copies the prompt (the disk persists, so a
-                         previous prompt.txt keeps the VM an agent VM)
+                         previous prompt.txt keeps the VM an agent VM);
+                         --rm deletes the VM when it stops normally
+                         (the attach session ends, or --timeout fires)
+                         instead of leaving it stopped
 pi-vm send <id|name> -m MSG
                          type MSG into the running VM's agent (the tmux
                          session 'agent' — agent VMs only); a newline in
@@ -114,7 +121,9 @@ pi-vm version           CLI + CH versions, image hashes
   `/workspace`; exiting `pi` ends the ssh session and stops the VM
   (graceful guest poweroff). `--shell` attaches a plain shell instead of
   the agent (exiting the shell stops the VM). The disk persists —
-  `pi-vm resume` reboots it. Need the VM to outlive your terminal? Run
+  `pi-vm resume` reboots it. With `--rm`, the VM is deleted (disk +
+  state + network) when it stops normally instead of left stopped.
+  Need the VM to outlive your terminal? Run
   `pi-vm` inside tmux.
 - **Terminal tab name** — an interactive attach sets the terminal tab
   name to `pi-vm <first-8-of-id> <project-basename>` (the basename is
@@ -225,7 +234,7 @@ pi-vm version           CLI + CH versions, image hashes
 - better ways to deal with long lasting commands. we likely need to see if pi can force commands to have a max timeout of lets say 10 minutes and never let the LLM do a timeout higher then that. maybe even 5 minutes tbh
 - better filters/sorting for ls
 - disable git safe.directory entirely
-- --rm flag, and maybe a shortcut for --no-mount for just asking quick questions
+- maybe a shortcut for --no-mount for just asking quick questions
 - fix bug where all qcow's ref tables are being rebuilt on every create even after a valid build
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually
 - fix git signatures failing for commits inside the sandbox

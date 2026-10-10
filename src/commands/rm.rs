@@ -45,57 +45,64 @@ impl Rm {
         }
         // Pass 2: delete in order; a failure on one does not stop the rest.
         for meta in &metas {
-            rc = rc.max(self.delete_one(home, meta));
+            rc = rc.max(delete_vm(home, meta, self.force));
         }
         rc
     }
+}
 
-    /// Delete one resolved VM. Returns the per-target exit code (0/1/5).
-    fn delete_one(&self, home: &VmHome, meta: &crate::state::VmMeta) -> i32 {
-        // raw load (no reconcile) to see the recorded state
-        let raw: crate::state::VmMeta = serde_json::from_str(
-            &std::fs::read_to_string(meta.meta_path(home)).unwrap_or_else(|_| "{}".into()),
-        )
-        .unwrap_or(meta.clone());
-        if raw.state == VmState::Running {
-            if !self.force {
-                eprintln!(
-                    "error: VM {} is recorded as running (pid {:?}) — use --force to kill it first",
-                    meta.id, raw.ch_pid
-                );
-                return 5;
-            }
-            if let Some(pid) = raw.ch_pid {
-                let _ = std::process::Command::new("kill").arg(pid.to_string()).output();
-            }
-            // also kill any CH supervising this disk (belt and braces)
-            if let Ok(o) = std::process::Command::new("pgrep")
-                .arg(format!("-f{}", meta.disk_path(home).display()))
-                .output()
-            {
-                for line in String::from_utf8_lossy(&o.stdout).lines() {
-                    let _ = std::process::Command::new("kill").arg(line.trim()).output();
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
+/// Delete one VM: (if running and `force`) kill the recorded pid + any CH
+/// supervising the disk, then lock, clean up the network, remove the VM
+/// dir. Returns the per-target exit code (0 = deleted, 1 = error,
+/// 5 = running without force).
+///
+/// Also the `--rm` auto-delete path for `create`/`resume` (which call it
+/// after a normal stop, with `force` true — the teardown already killed
+/// the children; the running-check is then just belt-and-braces).
+pub fn delete_vm(home: &VmHome, meta: &crate::state::VmMeta, force: bool) -> i32 {
+    // raw load (no reconcile) to see the recorded state
+    let raw: crate::state::VmMeta = serde_json::from_str(
+        &std::fs::read_to_string(meta.meta_path(home)).unwrap_or_else(|_| "{}".into()),
+    )
+    .unwrap_or(meta.clone());
+    if raw.state == VmState::Running {
+        if !force {
+            eprintln!(
+                "error: VM {} is recorded as running (pid {:?}) — use --force to kill it first",
+                meta.id, raw.ch_pid
+            );
+            return 5;
         }
-        let _lock = match crate::state::VmLock::acquire(meta, home) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 1;
+        if let Some(pid) = raw.ch_pid {
+            let _ = std::process::Command::new("kill").arg(pid.to_string()).output();
+        }
+        // also kill any CH supervising this disk (belt and braces)
+        if let Ok(o) = std::process::Command::new("pgrep")
+            .arg(format!("-f{}", meta.disk_path(home).display()))
+            .output()
+        {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let _ = std::process::Command::new("kill").arg(line.trim()).output();
             }
-        };
-        crate::state::cleanup_network(meta);
-        match crate::state::remove_vm(meta, home) {
-            Ok(()) => {
-                println!("deleted VM {}", meta.name.as_deref().unwrap_or(&meta.id));
-                0
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                1
-            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let _lock = match crate::state::VmLock::acquire(meta, home) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    crate::state::cleanup_network(meta);
+    match crate::state::remove_vm(meta, home) {
+        Ok(()) => {
+            println!("deleted VM {}", meta.name.as_deref().unwrap_or(&meta.id));
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
         }
     }
 }
@@ -180,6 +187,21 @@ mod tests {
         make_vm(&home, &a, Some("solo"));
         // delete by name still exits 0
         assert_eq!(rm(vec!["solo".into()]).run(&home), 0);
+        assert!(!home.vms_dir().join(&a).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_vm_direct_stopped_vm() {
+        // The --rm auto-delete path (create/resume): a normally-stopped
+        // VM is deleted via delete_vm with force=true — no running check
+        // branch, just lock + network cleanup + dir removal.
+        let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
+        let home = VmHome { root: dir.clone() };
+        let a = new_id();
+        make_vm(&home, &a, Some("autorm"));
+        let meta = resolve(&home, &a).unwrap();
+        assert_eq!(delete_vm(&home, &meta, true), 0);
         assert!(!home.vms_dir().join(&a).exists());
         std::fs::remove_dir_all(&dir).ok();
     }

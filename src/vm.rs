@@ -293,9 +293,11 @@ fn attach_title_prefix(meta: &VmMeta) -> Option<String> {
 /// timer starts the tmux session 'agent' (pi with the prompt), and
 /// attaches land in it. `timeout_s`: stop the VM N seconds after launch
 /// (the deadline starts now; boot time counts against it — pass a budget
-/// with a boot buffer).
+/// with a boot buffer). `rm`: the caller will auto-delete the VM after a
+/// normal stop (the --rm flag — only affects the stop message; the
+/// deletion itself happens in the caller, after the lock is released).
 pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: bool,
-           agent_mode: bool, timeout_s: Option<u64>) -> Result<i32, BootFail> {
+           agent_mode: bool, timeout_s: Option<u64>, rm: bool) -> Result<i32, BootFail> {
     let boot_start = std::time::Instant::now();
     let deadline = timeout_s
         .map(|s| boot_start + Duration::from_secs(s));
@@ -561,7 +563,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     meta.updated = state::now();
     if let Err(e) = meta.save(home) {
         // state save failed — don't orphan the running children
-        teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock);
+        teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
         return Err(BootFail::Other(e));
     }
 
@@ -600,7 +602,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             eprintln!("{SIGTSTP_HINT}");
         }
         if ch_child.try_wait().ok().flatten().is_some() {
-            teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock);
+            teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
             return Err(BootFail::BootFailed("CH exited during boot — see console.log".into()));
         }
         if console {
@@ -644,7 +646,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             eprintln!("VM did not become ssh-reachable in {boot_deadline}s — console tail:");
             tail_file(&meta.console_path(home), 20);
         }
-        teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock);
+        teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
         return Err(BootFail::SshUnreachable("boot timed out".into()));
     }
 
@@ -791,7 +793,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
         0
     };
 
-    teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock);
+    teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
     Ok(code)
 }
 
@@ -818,8 +820,12 @@ fn child_reaped(ch: &mut Child) -> bool {
     }
 }
 
-fn teardown(home: &VmHome, meta: &VmMeta, ch: &mut Child, vfs: &mut Option<Child>, _api_sock: &std::path::Path) {
-    println!("==> stopping VM (disk persists; `pi-vm resume {}` reboots it)", meta.id);
+fn teardown(home: &VmHome, meta: &VmMeta, ch: &mut Child, vfs: &mut Option<Child>, _api_sock: &std::path::Path, rm: bool) {
+    if rm {
+        println!("==> stopping VM (--rm: it will be deleted after the stop)");
+    } else {
+        println!("==> stopping VM (disk persists; `pi-vm resume {}` reboots it)", meta.id);
+    }
     // 1. Graceful: ask the GUEST to power off (ssh `systemctl poweroff`).
     // CH's SIGTERM is an immediate host-side poweroff (vm_delete), so the
     // only clean stop is a guest-initiated shutdown — the guest flushes its
