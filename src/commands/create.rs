@@ -38,16 +38,13 @@ pub struct Create {
     /// Attach to a plain shell in /workspace instead of starting the agent
     #[arg(long)]
     pub shell: bool,
-    /// Initial prompt for the agent (host path; the CONTENT is delivered to
-    /// the VM via the seed ISO and passed to pi as its first message — pi
-    /// stays interactive afterwards, so `pi-vm send` can steer it)
+    /// Agent prompt (host path): copied into <project>/prompt.txt — the
+    /// guest's timer starts pi in a tmux session 'agent' with that file
+    /// as its first message (pi stays interactive, so `pi-vm send` can
+    /// steer it). Requires a shared project (a --no-mount VM has no
+    /// /workspace for the prompt).
     #[arg(long)]
     pub prompt_file: Option<String>,
-    /// pi's session directory (a host path inside the shared project maps to
-    /// /workspace/<rel>; an absolute path is used as a guest path, e.g.
-    /// /root/pi-sessions)
-    #[arg(long)]
-    pub session_dir: Option<String>,
     /// Stop the VM N seconds after launch (boot time counts against it —
     /// pass a budget with a boot buffer)
     #[arg(long)]
@@ -64,34 +61,32 @@ impl Create {
             (Some(p), false) => Some(p.clone()),
             _ => None,
         };
-        let agent = match (&self.prompt_file, &self.session_dir) {
-            (None, None) => None,
-            (pf, sd) => {
-                let prompt = match pf.as_ref()
-                    .map(|p| std::fs::read_to_string(p))
-                    .transpose()
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("error: cannot read prompt file: {e}");
-                        return 2;
-                    }
-                };
-                let session_dir = match sd.as_ref()
-                    .map(|p| crate::vm::session_dir_to_guest(project.as_deref(), p))
-                    .transpose()
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        return 2;
-                    }
-                };
-                Some(crate::vm::AgentLaunch {
-                    script: crate::vm::build_launch_script(session_dir.as_deref()),
-                    prompt,
-                })
-            }
+        // Agent mode: the prompt must end up in the shared folder (the
+        // guest reads /workspace/prompt.txt — no ISO delivery involved).
+        // The flag copies it; a hand-placed <project>/prompt.txt also
+        // makes the VM an agent VM (the guest timer triggers on presence).
+        let agent_mode = match &self.prompt_file {
+            Some(pf) => match &project {
+                Some(p) => {
+                    let content = std::fs::read_to_string(pf).unwrap_or_else(|e| {
+                        eprintln!("error: cannot read prompt file {pf}: {e}");
+                        std::process::exit(2);
+                    });
+                    std::fs::write(std::path::Path::new(p).join("prompt.txt"), content)
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: cannot write {p}/prompt.txt: {e}");
+                            std::process::exit(2);
+                        });
+                    true
+                }
+                None => {
+                    eprintln!("error: --prompt-file requires a shared project (the prompt lands in <project>/prompt.txt; a --no-mount VM has no /workspace)");
+                    return 2;
+                }
+            },
+            None => project.as_ref()
+                .map(|p| std::path::Path::new(p).join("prompt.txt").exists())
+                .unwrap_or(false),
         };
         let kvm = match self.kvm.as_str() {
             "on" => true,
@@ -119,7 +114,7 @@ impl Create {
                 return 2;
             }
         };
-        match boot(home, meta, attach, self.console, self.shell, agent, self.timeout) {
+        match boot(home, meta, attach, self.console, self.shell, agent_mode, self.timeout) {
             Ok(code) => code,
             Err(f) => {
                 eprintln!("error: {}", f.msg());

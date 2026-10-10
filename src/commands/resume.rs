@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use clap::Args;
 
 use crate::state::VmHome;
-use crate::vm::{boot, resume_vm, AgentLaunch};
+use crate::vm::{boot, resume_vm};
 
 #[derive(Args)]
 pub struct Resume {
@@ -17,15 +17,11 @@ pub struct Resume {
     /// Attach to a plain shell in /workspace instead of starting the agent
     #[arg(long)]
     pub shell: bool,
-    /// Re-deliver an initial prompt to the agent (host path; the seed ISO is
-    /// regenerated on every boot, so a resume can re-launch the agent with a
-    /// new prompt)
+    /// Re-copy the agent prompt into <project>/prompt.txt (the seed of the
+    /// agent VM — the guest timer starts pi with it; a hand-placed
+    /// prompt.txt also makes the VM an agent VM)
     #[arg(long)]
     pub prompt_file: Option<String>,
-    /// Re-deliver pi's session directory (host path inside the shared project
-    /// -> /workspace/<rel>, or an absolute guest path)
-    #[arg(long)]
-    pub session_dir: Option<String>,
     /// Stop the VM N seconds after launch
     #[arg(long)]
     pub timeout: Option<u64>,
@@ -41,37 +37,30 @@ impl Resume {
                 return 2;
             }
         };
-        // The shared project (for --session-dir mapping) is the VM's project.
-        let agent = match (&self.prompt_file, &self.session_dir) {
-            (None, None) => None,
-            (pf, sd) => {
-                let prompt = match pf.as_ref()
-                    .map(|p| std::fs::read_to_string(p))
-                    .transpose()
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("error: cannot read prompt file: {e}");
-                        return 2;
-                    }
-                };
-                let session_dir = match sd.as_ref()
-                    .map(|p| crate::vm::session_dir_to_guest(meta.project.as_deref(), p))
-                    .transpose()
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        return 2;
-                    }
-                };
-                Some(AgentLaunch {
-                    script: crate::vm::build_launch_script(session_dir.as_deref()),
-                    prompt,
-                })
-            }
+        let agent_mode = match &self.prompt_file {
+            Some(pf) => match &meta.project {
+                Some(p) => {
+                    let content = std::fs::read_to_string(pf).unwrap_or_else(|e| {
+                        eprintln!("error: cannot read prompt file {pf}: {e}");
+                        std::process::exit(2);
+                    });
+                    std::fs::write(std::path::Path::new(p).join("prompt.txt"), content)
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: cannot write {p}/prompt.txt: {e}");
+                            std::process::exit(2);
+                        });
+                    true
+                }
+                None => {
+                    eprintln!("error: --prompt-file requires a shared project (this VM has no /workspace)");
+                    return 2;
+                }
+            },
+            None => meta.project.as_ref()
+                .map(|p| std::path::Path::new(p).join("prompt.txt").exists())
+                .unwrap_or(false),
         };
-        match boot(home, meta, attach, self.console, self.shell, agent, self.timeout) {
+        match boot(home, meta, attach, self.console, self.shell, agent_mode, self.timeout) {
             Ok(code) => code,
             Err(f) => {
                 eprintln!("error: {}", f.msg());

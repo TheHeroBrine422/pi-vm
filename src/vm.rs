@@ -78,75 +78,6 @@ pub struct VmConfig {
     pub squash_uid: Option<u32>,
 }
 
-/// Agent launch parameters, delivered to the VM via the per-boot seed ISO
-/// (cloud-init runcmd + the baked net-fallback convergence loop both
-/// install them; the ISO is regenerated on every boot, so a resume can
-/// re-deliver or reset them).
-pub struct AgentLaunch {
-    /// Guest launch script (installed at /usr/local/bin/pi-vm-launch.sh;
-    /// the session dir is embedded in it).
-    pub script: String,
-    /// Initial prompt content (delivered as pi-prompt.txt; None = no prompt).
-    pub prompt: Option<String>,
-}
-
-/// The guest launch script for agent VMs. Reads the prompt from
-/// /root/pi-prompt.txt (the CONTENT is delivered via the ISO, so no shell
-/// escaping is involved) and passes it to pi as the first message (pi stays
-/// interactive afterwards — `pi "msg"` without --print). When run under the
-/// timer-launched tmux session (PI_VM_SERVICE set), powers the VM off when
-/// pi exits, freeing the VM for the next one.
-pub fn build_launch_script(session_dir: Option<&str>) -> String {
-    let sd = session_dir.unwrap_or("");
-    // NOTE: no adjacent string-literal concatenation (this rustc build
-    // rejects it) — one raw string, format!-substituted.
-    format!(
-        r#"#!/bin/bash
-cd /workspace
-P=$(cat /root/pi-prompt.txt 2>/dev/null)
-ARGS=()
-[ -n "{sd}" ] && ARGS+=(--session-dir "{sd}")
-if [ -n "$P" ]; then
-pi "${{ARGS[@]}}" "$P"
-else
-pi "${{ARGS[@]}}"
-fi
-rc=$?
-if [ -n "$PI_VM_SERVICE" ]; then
-echo "pi-vm-agent: pi exited (rc=$rc) — powering off"
-systemctl poweroff
-fi
-exit $rc
-"#
-    )
-}
-
-/// Map a --session-dir path (host or guest) to the guest path pi uses.
-/// A path inside the shared project maps to /workspace/<rel>; an absolute
-/// path outside the project is used as-is (a guest path, e.g.
-/// /root/pi-sessions); anything else is rejected. The path must not contain
-/// shell metacharacters (it is embedded in the launch script).
-pub fn session_dir_to_guest(project: Option<&str>, path: &str) -> Result<String, String> {
-    for bad in [' ', '\t', '\n', '\r', '"', '\'', '$', '`', '\\'] {
-        if path.contains(bad) {
-            return Err(format!(
-                "session dir {path:?} contains {bad:?} — it is embedded in the launch script; use a path without shell metacharacters"
-            ));
-        }
-    }
-    if let Some(p) = project
-        && let Ok(rel) = std::path::Path::new(path).strip_prefix(std::path::Path::new(p))
-    {
-        return Ok(format!("/workspace/{}", rel.to_string_lossy()));
-    }
-    if path.starts_with('/') {
-        return Ok(path.to_string());
-    }
-    Err(format!(
-        "session dir {path:?} must be inside the shared project (it maps to /workspace/...) or an absolute guest path (e.g. /root/pi-sessions)"
-    ))
-}
-
 /// Create a new VM: id, meta, ssh key, disk copy + resize.
 pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     // preflight
@@ -317,12 +248,13 @@ pub fn direct_boot_args(home: &VmHome) -> Option<Vec<String>> {
 }
 
 /// Boot the VM and (if attach) drop into ssh. Returns the exit code.
-/// `agent`: deliver the agent launch script + prompt via the seed ISO and
-/// attach to the tmux session the guest runs pi in (None = plain `pi`).
-/// `timeout_s`: stop the VM N seconds after launch (the deadline starts now;
-/// boot time counts against it — pass a budget with a boot buffer).
+/// `agent_mode`: the shared project carries a prompt.txt — the guest's
+/// timer starts the tmux session 'agent' (pi with the prompt), and
+/// attaches land in it. `timeout_s`: stop the VM N seconds after launch
+/// (the deadline starts now; boot time counts against it — pass a budget
+/// with a boot buffer).
 pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: bool,
-           agent: Option<AgentLaunch>, timeout_s: Option<u64>) -> Result<i32, BootFail> {
+           agent_mode: bool, timeout_s: Option<u64>) -> Result<i32, BootFail> {
     let boot_start = std::time::Instant::now();
     let deadline = timeout_s
         .map(|s| boot_start + Duration::from_secs(s));
@@ -454,23 +386,13 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     .map_err(|e| BootFail::Preflight(e.to_string()))?;
     std::fs::write(
         nocloud.join("user-data"),
-        user_data(&meta, &pubkey, agent.as_ref()),
+        user_data(&meta, &pubkey),
     )
     .map_err(|e| BootFail::Preflight(e.to_string()))?;
     // ssh-pubkey on the ISO: the baked image's pi-vm-net unit (the
     // cloud-init-independent fallback) installs it the same way the runcmd does.
     std::fs::write(nocloud.join("ssh-pubkey"), format!("{}\n", pubkey))
         .map_err(|e| BootFail::Preflight(e.to_string()))?;
-    // Agent launch assets (cloud-init ignores the extra ISO files; the
-    // runcmd + the baked net-fallback loop install them from the ISO).
-    if let Some(a) = &agent {
-        std::fs::write(nocloud.join("pi-launch.sh"), &a.script)
-            .map_err(|e| BootFail::Preflight(e.to_string()))?;
-        if let Some(p) = &a.prompt {
-            std::fs::write(nocloud.join("pi-prompt.txt"), p)
-                .map_err(|e| BootFail::Preflight(e.to_string()))?;
-        }
-    }
 
     let iso = meta.vm_dir(home).join("nocloud.iso");
     run("genisoimage", &[
@@ -684,6 +606,41 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     println!("   boot timing: preflight {:.1}s, guest boot {:.1}s, total {:.1}s to ssh-ready",
         preflight, guest_boot, preflight + guest_boot);
 
+    // Agent mode: start the tmux session 'agent' over ssh. The ssh
+    // session context CAN read the virtiofs /workspace (SELinux
+    // virtiofs_t is denied to the systemd context — a systemd timer
+    // cannot trigger on /workspace/prompt.txt), so the supervisor does
+    // it. ssh-ready implies the /workspace mount is up (the baked
+    // pi-vm-net unit runs Before=sshd and mounts it first).
+    if agent_mode && !shell {
+        let key_s = key.to_string_lossy().into_owned();
+        let start_cmd = "tmux has-session -t agent 2>/dev/null || tmux new-session -d -s agent -f /dev/null \"tmux set status off; PI_VM_SERVICE=1 /usr/local/bin/pi-vm-launch.sh\"";
+        let mut started = false;
+        for _ in 0..3 {
+            let o = Command::new("ssh")
+                .args([
+                    "-i", &key_s,
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=10",
+                    &format!("root@{}", meta.ip),
+                    start_cmd,
+                ])
+                .output();
+            if o.map(|o| o.status.success()).unwrap_or(false) {
+                started = true;
+                break;
+            }
+            thread::sleep(Duration::from_secs(10));
+        }
+        if started {
+            println!("   agent session 'agent' started (pi with the prompt)");
+        } else {
+            eprintln!("   WARN: could not start the agent session — the attach fallback runs the launch script directly");
+        }
+    }
+
     // --- attach or foreground-wait ---
     let code = if attach {
         println!("==> attached — exiting the ssh session stops the VM (Ctrl-C goes to the remote session; SIGTERM stops the VM)");
@@ -709,7 +666,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
         // script directly — the user still gets pi, just without send.
         let attach_cmd = if shell {
             "cd /workspace; bash"
-        } else if agent.is_some() {
+        } else if agent_mode {
             "cd /workspace; for i in $(seq 1 20); do tmux has-session -t agent 2>/dev/null && break; sleep 1; done; if tmux has-session -t agent 2>/dev/null; then tmux attach -t agent; else /usr/local/bin/pi-vm-launch.sh; fi"
         } else {
             "cd /workspace; pi"
@@ -1023,7 +980,7 @@ fn install_signal_handler(interrupted: Arc<AtomicBool>, terminated: Arc<AtomicBo
 /// is up even if the virtiofs mount retry (up to 120 s) is slow or fails
 /// (v1's order put the mount first; v1 had no boot timeout — the user ssh'd
 /// from a second terminal — so the reorder is a v2 robustness fix).
-fn user_data(meta: &VmMeta, pubkey: &str, agent: Option<&AgentLaunch>) -> String {
+fn user_data(meta: &VmMeta, pubkey: &str) -> String {
     // Network: wait for the virtio NIC (it can appear late, during the
     // udev coldplug), then configure ip/link/route + DNS.
     let net = format!(
@@ -1109,32 +1066,12 @@ fi",
         ));
         s.push('\n');
     }
-    // Agent launch assets from the ISO (fast path for first boots; the
-    // baked net-fallback loop does the same from /mnt/nocloud on EVERY
-    // boot — cloud-init's NoCloud seed detection is flaky on resume boots).
-    // The reset branch matters: the disk persists, so a boot WITHOUT a
-    // delivered script must clear the previous boot's script + session,
-    // or the timer would relaunch a stale agent.
-    if agent.is_some() {
-        s.push_str(&runcmd_block(
-            "if [ -f /cdrom/pi-launch.sh ]; then
-  install -m 755 /cdrom/pi-launch.sh /usr/local/bin/pi-vm-launch.sh 2>/dev/null;
-  chcon -t bin_t /usr/local/bin/pi-vm-launch.sh 2>/dev/null;
-  if [ -f /cdrom/pi-prompt.txt ]; then
-    cp /cdrom/pi-prompt.txt /root/pi-prompt.txt;
-  fi;
-else
-  rm -f /usr/local/bin/pi-vm-launch.sh /root/pi-prompt.txt;
-fi",
-        ));
-        s.push('\n');
-    }
     s
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{user_data, build_launch_script, session_dir_to_guest, AgentLaunch};
+    use super::user_data;
     use crate::state::{VmMeta, VmState};
 
     fn test_meta() -> VmMeta {
@@ -1180,53 +1117,9 @@ mod tests {
 
     #[test]
     fn user_data_runcmd_blocks_are_valid_yaml() {
-        let s = user_data(&test_meta(), "ssh-ed25519 AAAA test", None);
-        // 5 base entries (net, ssh, grow, mount, extra) — no agent entry
-        // when no agent launch is delivered.
+        let s = user_data(&test_meta(), "ssh-ed25519 AAAA test");
+        // 5 base entries (net, ssh, grow, mount, extra)
         assert_valid_yaml(&s, 5);
     }
-
-    #[test]
-    fn user_data_with_agent_adds_a_valid_yaml_agent_entry() {
-        let agent = AgentLaunch {
-            script: build_launch_script(Some("/workspace/session")),
-            prompt: Some("hello agent".into()),
-        };
-        let s = user_data(&test_meta(), "ssh-ed25519 AAAA test", Some(&agent));
-        assert_valid_yaml(&s, 6);
-        assert!(s.contains("pi-launch.sh"), "agent entry must install the launch script");
-        assert!(s.contains("rm -f /usr/local/bin/pi-vm-launch.sh"),
-            "agent entry must reset when no script is delivered");
-    }
-
-    #[test]
-    fn launch_script_shape() {
-        let s = build_launch_script(Some("/workspace/session"));
-        assert!(s.contains("cd /workspace"));
-        assert!(s.contains("P=$(cat /root/pi-prompt.txt 2>/dev/null)"));
-        assert!(s.contains("--session-dir \"/workspace/session\""));
-        assert!(s.contains("PI_VM_SERVICE"));
-        assert!(s.contains("systemctl poweroff"));
-        // the no-session-dir variant must not embed a path
-        let s2 = build_launch_script(None);
-        assert!(!s2.contains("--session-dir \"/"));
-        assert!(s2.contains("[ -n \"\" ]"), "empty check must remain: {}", s2.lines().nth(4).unwrap_or(""));
-    }
-
-    #[test]
-    fn session_dir_mapping() {
-        // inside the shared project -> /workspace/<rel>
-        assert_eq!(session_dir_to_guest(Some("/proj"), "/proj/sub/sess").unwrap(), "/workspace/sub/sess");
-        // absolute path outside the project -> used as-is (guest path)
-        assert_eq!(session_dir_to_guest(None, "/root/sess").unwrap(), "/root/sess");
-        assert_eq!(session_dir_to_guest(Some("/proj"), "/root/sess").unwrap(), "/root/sess");
-        // relative path without a project -> rejected
-        assert!(session_dir_to_guest(None, "rel").is_err());
-        // shell metacharacters -> rejected (embedded in the script)
-        assert!(session_dir_to_guest(Some("/proj"), "/proj/a b").is_err());
-        assert!(session_dir_to_guest(None, "/root/$(x)").is_err());
-        assert!(session_dir_to_guest(None, "/root/a'b").is_err());
-    }
 }
-
 
