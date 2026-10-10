@@ -29,6 +29,10 @@ pi-vm bake
 
 ## Commands
 
+`pi-vm <path>` is shorthand for `pi-vm create <path>` — `create` is the
+default subcommand: any bare first positional that is not a subcommand
+name creates a VM (e.g. `pi-vm /tmp/proj`).
+
 ```
 pi-vm install [--check]   one-time host setup: packages, CH +
                          cloud image (sha256-verified), nested KVM;
@@ -38,7 +42,7 @@ pi-vm bake [--pi-dir D] [--timeout N]
                          full toolchain + direct-boot kernel assets) —
                          the VM equivalent of a container image's
                          build-time COPY
-pi-vm create [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
+pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
               [--extra-disk N] [--kvm on|off] [--squash-uid U] [--no-mount]
               [--console] [--shell] [--prompt-file F] [--timeout N] [--rm]
                          new VM from the pre-baked base (no path, or
@@ -253,7 +257,6 @@ pi-vm version           CLI + CH versions, image hashes
 - possibly keep older versions of the baked image and add a `pi-vm images` command?
 - codemode
 - maybe change this where you need to run it with sudo or similar to like the root access thing docker does since having sudo in the script is annoying cause if it times out you have to type in the password at the start and end of the session
-- possibly change "create" to be the default command since I use it so much
 - better tailscale aperture support. need to auto include the /etc/hosts file and figure out a better networking solution
 - Later goals (not required for v1):
   - Simplify subagents (fewer options for subagent types)
