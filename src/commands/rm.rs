@@ -56,6 +56,10 @@ impl Rm {
 /// dir. Returns the per-target exit code (0 = deleted, 1 = error,
 /// 5 = running without force).
 ///
+/// A "running" record whose supervisor pid is dead (host reboot, kill -9
+/// of the supervisor) is reconciled to stopped first — the stale record
+/// does not block the deletion.
+///
 /// Also the `--rm` auto-delete path for `create`/`resume` (which call it
 /// after a normal stop, with `force` true — the teardown already killed
 /// the children; the running-check is then just belt-and-braces).
@@ -66,26 +70,43 @@ pub fn delete_vm(home: &VmHome, meta: &crate::state::VmMeta, force: bool) -> i32
     )
     .unwrap_or(meta.clone());
     if raw.state == VmState::Running {
-        if !force {
+        // Reconcile: a "running" record whose supervisor pid is dead
+        // (host reboot, kill -9 of the supervisor) is just a record of
+        // the last session — rewrite meta.json to stopped and delete.
+        let alive = raw.ch_pid.map(crate::state::pid_alive).unwrap_or(false);
+        if !alive {
+            let mut fixed = raw.clone();
+            fixed.state = VmState::Stopped;
+            fixed.ch_pid = None;
+            fixed.updated = crate::state::now();
+            if fixed.save(home).is_ok() {
+                println!(
+                    "note: VM {} was recorded as running (pid {}) but the supervisor is gone — treating as stopped",
+                    meta.id,
+                    raw.ch_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                );
+            }
+        } else if !force {
             eprintln!(
-                "error: VM {} is recorded as running (pid {:?}) — use --force to kill it first",
-                meta.id, raw.ch_pid
+                "error: VM {} is running (pid {}) — use --force to kill it first",
+                meta.id, raw.ch_pid.unwrap()
             );
             return 5;
-        }
-        if let Some(pid) = raw.ch_pid {
-            let _ = std::process::Command::new("kill").arg(pid.to_string()).output();
-        }
-        // also kill any CH supervising this disk (belt and braces)
-        if let Ok(o) = std::process::Command::new("pgrep")
-            .arg(format!("-f{}", meta.disk_path(home).display()))
-            .output()
-        {
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                let _ = std::process::Command::new("kill").arg(line.trim()).output();
+        } else {
+            if let Some(pid) = raw.ch_pid {
+                let _ = std::process::Command::new("kill").arg(pid.to_string()).output();
             }
+            // also kill any CH supervising this disk (belt and braces)
+            if let Ok(o) = std::process::Command::new("pgrep")
+                .arg(format!("-f{}", meta.disk_path(home).display()))
+                .output()
+            {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    let _ = std::process::Command::new("kill").arg(line.trim()).output();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
     }
     let _lock = match crate::state::VmLock::acquire(meta, home) {
         Ok(l) => l,
@@ -112,7 +133,7 @@ mod tests {
     use super::*;
     use crate::state::{new_id, VmMeta};
 
-    fn make_vm(home: &VmHome, id: &str, name: Option<&str>) {
+    fn make_vm(home: &VmHome, id: &str, name: Option<&str>, state: VmState, ch_pid: Option<i32>) {
         let meta = VmMeta {
             id: id.into(),
             name: name.map(String::from),
@@ -129,8 +150,8 @@ mod tests {
             kvm: false,
             squash_uid: 1000,
             base_image_sha256: None,
-            state: VmState::Stopped,
-            ch_pid: None,
+            state,
+            ch_pid,
         };
         meta.save(home).unwrap();
     }
@@ -139,14 +160,24 @@ mod tests {
         Rm { targets, force: false }
     }
 
+    /// Spawn a short-lived process, kill + reap it, and return its (now
+    /// dead) pid.
+    fn dead_pid() -> i32 {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let _ = child.kill();
+        let _ = child.wait();
+        pid
+    }
+
     #[test]
     fn rm_multiple_ids() {
         let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
         let home = VmHome { root: dir.clone() };
         let a = new_id();
         let b = new_id();
-        make_vm(&home, &a, Some("alpha"));
-        make_vm(&home, &b, Some("beta"));
+        make_vm(&home, &a, Some("alpha"), VmState::Stopped, None);
+        make_vm(&home, &b, Some("beta"), VmState::Stopped, None);
         assert_eq!(rm(vec![a.clone(), b.clone()]).run(&home), 0);
         assert!(!home.vms_dir().join(&a).exists());
         assert!(!home.vms_dir().join(&b).exists());
@@ -158,7 +189,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
         let home = VmHome { root: dir.clone() };
         let a = new_id();
-        make_vm(&home, &a, None);
+        make_vm(&home, &a, None, VmState::Stopped, None);
         // "nope" does not exist; the existing VM must still be deleted
         assert_eq!(rm(vec!["nope".into(), a.clone()]).run(&home), 2);
         assert!(!home.vms_dir().join(&a).exists());
@@ -170,7 +201,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
         let home = VmHome { root: dir.clone() };
         let a = new_id();
-        make_vm(&home, &a, None);
+        make_vm(&home, &a, None, VmState::Stopped, None);
         // full id + its own prefix = the same VM: deleted once, no error
         assert_eq!(rm(vec![a.clone(), a[..4].into()]).run(&home), 0);
         assert!(!home.vms_dir().join(&a).exists());
@@ -184,7 +215,7 @@ mod tests {
         // not-found still exits 2
         assert_eq!(rm(vec!["nope".into()]).run(&home), 2);
         let a = new_id();
-        make_vm(&home, &a, Some("solo"));
+        make_vm(&home, &a, Some("solo"), VmState::Stopped, None);
         // delete by name still exits 0
         assert_eq!(rm(vec!["solo".into()]).run(&home), 0);
         assert!(!home.vms_dir().join(&a).exists());
@@ -199,10 +230,53 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
         let home = VmHome { root: dir.clone() };
         let a = new_id();
-        make_vm(&home, &a, Some("autorm"));
+        make_vm(&home, &a, Some("autorm"), VmState::Stopped, None);
         let meta = resolve(&home, &a).unwrap();
         assert_eq!(delete_vm(&home, &meta, true), 0);
         assert!(!home.vms_dir().join(&a).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+
+    fn rm_deletes_stale_running_without_force() {
+        let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
+        let home = VmHome { root: dir.clone() };
+        let a = new_id();
+        // A stale "running" record: the supervisor pid is dead (host
+        // reboot, kill -9 of the supervisor) — rm must not block on it.
+        make_vm(&home, &a, None, VmState::Running, Some(dead_pid()));
+        assert_eq!(rm(vec![a.clone()]).run(&home), 0);
+        assert!(!home.vms_dir().join(&a).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rm_refuses_genuinely_running_without_force() {
+        let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
+        let home = VmHome { root: dir.clone() };
+        let a = new_id();
+        // A genuinely running VM: the recorded pid is alive (our own test
+        // process) — rm must still refuse without --force.
+        make_vm(&home, &a, None, VmState::Running, Some(std::process::id() as i32));
+        assert_eq!(rm(vec![a.clone()]).run(&home), 5);
+        assert!(home.vms_dir().join(&a).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rm_force_deletes_genuinely_running() {
+        let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
+        let home = VmHome { root: dir.clone() };
+        let a = new_id();
+        // A live stand-in for the supervisor (NOT our own pid — --force
+        // kills it).
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        make_vm(&home, &a, None, VmState::Running, Some(child.id() as i32));
+        assert_eq!(Rm { targets: vec![a.clone()], force: true }.run(&home), 0);
+        assert!(!home.vms_dir().join(&a).exists());
+        let _ = child.kill();
+        let _ = child.wait();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -195,23 +195,35 @@ impl VmMeta {
 
     /// Load meta.json. A stale "running" state is reconciled to "stopped":
     /// there is no daemon, so a running record without a live supervisor is
-    /// just a record of the last session. (If ch_pid is alive, the VM is
-    /// genuinely running — the flock is the real guard; keep the record.)
+    /// just a record of the last session (host reboot, kill -9 of the
+    /// supervisor). The reconciliation is persisted to meta.json so a stale
+    /// "running" record can't keep blocking `rm`. (If ch_pid is alive, the
+    /// VM is genuinely running — the flock is the real guard; keep the
+    /// record.)
     pub fn load(home: &VmHome, id: &str) -> Result<Self, String> {
         let path = home.vms_dir().join(id).join("meta.json");
         let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let mut meta: VmMeta = serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
         if meta.state == VmState::Running {
-            let pid_alive = meta.ch_pid
-                .map(|pid| std::process::Command::new("kill").args(["-0", &pid.to_string()]).output().map(|o| o.status.success()).unwrap_or(false))
-                .unwrap_or(false);
-            if !pid_alive {
+            let alive = meta.ch_pid.map(pid_alive).unwrap_or(false);
+            if !alive {
                 meta.state = VmState::Stopped;
                 meta.ch_pid = None;
+                meta.updated = now();
+                // best-effort: the in-memory reconciliation stands even if
+                // the save fails (e.g. read-only fs)
+                let _ = meta.save(home);
             }
         }
         Ok(meta)
     }
+}
+
+/// True if the process is alive (checked via /proc — the same pattern as
+/// `send`). A "running" record whose supervisor pid is dead (host reboot,
+/// kill -9 of the supervisor) is just a record of the last session.
+pub fn pid_alive(pid: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// Generate a 12-hex unique id (docker-style).
@@ -568,6 +580,82 @@ mod tests {
         assert_eq!(resolve(&home, &id[..4]).unwrap().id, id);
         assert_eq!(resolve(&home, "myvm").unwrap().id, id);
         assert!(resolve(&home, "nope").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn test_meta(id: &str, state: VmState, ch_pid: Option<i32>) -> VmMeta {
+        VmMeta {
+            id: id.into(),
+            name: None,
+            created: 0,
+            updated: 0,
+            project: Some("/tmp".into()),
+            subnet: "172.16.9.0/24".into(),
+            ip: "172.16.9.2".into(),
+            mac: "52:54:00:00:00:09".into(),
+            vcpus: 1,
+            memory_mb: 1024,
+            disk_gb: 80,
+            extra_disk: false,
+            kvm: false,
+            squash_uid: 1000,
+            state,
+            ch_pid,
+            base_image_sha256: None,
+        }
+    }
+
+    /// Spawn a short-lived process, kill + reap it, and return its (now
+    /// dead) pid.
+    fn dead_pid() -> i32 {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        let _ = child.kill();
+        let _ = child.wait();
+        pid
+    }
+
+    #[test]
+    fn pid_alive_detects_live_and_dead() {
+        assert!(pid_alive(std::process::id() as i32));
+        assert!(!pid_alive(dead_pid()));
+    }
+
+    #[test]
+    fn load_reconciles_stale_running_and_persists() {
+        let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
+        let home = VmHome { root: dir.clone() };
+        let id = new_id();
+        test_meta(&id, VmState::Running, Some(dead_pid())).save(&home).unwrap();
+        let loaded = VmMeta::load(&home, &id).unwrap();
+        assert_eq!(loaded.state, VmState::Stopped);
+        assert_eq!(loaded.ch_pid, None);
+        // The reconciliation must be persisted: a raw re-read sees stopped.
+        let raw: VmMeta = serde_json::from_str(
+            &std::fs::read_to_string(home.vms_dir().join(&id).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw.state, VmState::Stopped);
+        assert_eq!(raw.ch_pid, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_keeps_genuinely_running() {
+        let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
+        let home = VmHome { root: dir.clone() };
+        let id = new_id();
+        let self_pid = std::process::id() as i32;
+        test_meta(&id, VmState::Running, Some(self_pid)).save(&home).unwrap();
+        let loaded = VmMeta::load(&home, &id).unwrap();
+        assert_eq!(loaded.state, VmState::Running);
+        assert_eq!(loaded.ch_pid, Some(self_pid));
+        // The file must be left untouched.
+        let raw: VmMeta = serde_json::from_str(
+            &std::fs::read_to_string(home.vms_dir().join(&id).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw.state, VmState::Running);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

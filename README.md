@@ -89,7 +89,11 @@ pi-vm logs <id|name> [-f] [-n N]
 pi-vm rm <id|name>... [--force]
                          delete one or more VMs (disk + state + network);
                          all targets are processed, a failure on one does
-                         not stop the rest
+                         not stop the rest; a stale "running" record
+                         (the supervisor is gone, e.g. after a host
+                         reboot or kill -9 of the supervisor) is
+                         reconciled to stopped automatically — only a
+                         genuinely running VM needs --force
 pi-vm doctor [--detailed]
                          host diagnostics: KVM, packages, assets, images
 pi-vm version           CLI + CH versions, image hashes
@@ -228,7 +232,6 @@ pi-vm version           CLI + CH versions, image hashes
 
 - overlayfs to make the individual vhds smaller
 - gh cli/creds because api rate limits are a bitch, but also not letting it have write access to my accounts
-- vms continue to get registered as running in some cases when they arent when trying to run pi-vm rm
 - Separate VM work trees via CoW
 - a better solution for syncing pi directory
 - better ways to deal with long lasting commands. we likely need to see if pi can force commands to have a max timeout of lets say 10 minutes and never let the LLM do a timeout higher then that. maybe even 5 minutes tbh
