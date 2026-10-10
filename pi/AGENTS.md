@@ -8,9 +8,10 @@ You are running as root inside a full-featured Fedora Cloud 44 VM sandbox:
   can be installed on demand — when something you need to run is blocked
   by a missing tool, install the tools that are necessary.
 - It is safe to install packages, create files, and run destructive commands.
-- git push is intentionally not available (no remote access): the user
-  decides what gets pushed. Commit locally and leave pushing to the user —
-  do not try to work around it (tokens, HTTPS, new keys).
+- The VM doesn't have git creds, so pushing is impossible and fetch/pull 
+  are often impossible due to private repos. Commit locally and ask 
+  the user to run remote git operations on the host; do not work around 
+  it (tokens, HTTPS, new keys).
 - If you need to check code, docs, or information about dependencies
   and related projects, clone the entire repo to `/tmp`. Verifying
   the source implementation is usually better and easier than trying
