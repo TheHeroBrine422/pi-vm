@@ -956,8 +956,16 @@ fn tail_file(p: &std::path::Path, n: usize) {
 /// diagnostic hiccup never blocks the boot.
 fn qemu_img_cleanly_closed(disk: &std::path::Path) -> bool {
     run("qemu-img", &["info", disk.to_str().unwrap()])
-        .map(|out| out.contains("cleanly shut down: yes"))
+        .map(|out| qemu_img_info_cleanly_closed(&out))
         .unwrap_or(true)
+}
+
+/// Parse the `qemu-img info` output: qemu prints the line
+/// "cleanly shut down: no" ONLY when the image is dirty (qemu 8.2+;
+/// older versions print no clean-state line at all), so the disk was
+/// cleanly closed unless that line is present.
+fn qemu_img_info_cleanly_closed(out: &str) -> bool {
+    !out.contains("cleanly shut down: no")
 }
 
 /// SIGINT (Ctrl-C) and SIGTERM set separate flags: Ctrl-C only interrupts
@@ -1071,7 +1079,7 @@ fi",
 
 #[cfg(test)]
 mod tests {
-    use super::user_data;
+    use super::{qemu_img_info_cleanly_closed, user_data};
     use crate::state::{VmMeta, VmState};
 
     fn test_meta() -> VmMeta {
@@ -1120,6 +1128,20 @@ mod tests {
         let s = user_data(&test_meta(), "ssh-ed25519 AAAA test");
         // 5 base entries (net, ssh, grow, mount, extra)
         assert_valid_yaml(&s, 5);
+    }
+
+    /// The clean-state check must not run the refcount rebuild on a
+    /// validly-closed disk: `qemu-img info` prints "cleanly shut down: no"
+    /// only for a dirty image (a clean one gets no such line), so the
+    /// absence of the line means cleanly closed.
+    #[test]
+    fn qemu_img_info_cleanly_closed_check() {
+        // clean: no clean-state line at all (the qemu 8.2+ format)
+        assert!(qemu_img_info_cleanly_closed(
+            "image: disk.qcow2\nfile format: qcow2\nvirtual size: 80 GiB (85899345920 bytes)\ndisk size: 1.2 GiB\n"));
+        // dirty: the "cleanly shut down: no" line is present
+        assert!(!qemu_img_info_cleanly_closed(
+            "image: disk.qcow2\nfile format: qcow2\nvirtual size: 80 GiB (85899345920 bytes)\ndisk size: 1.2 GiB\ncleanly shut down: no\n"));
     }
 }
 
