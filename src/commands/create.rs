@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use clap::Args;
 
 use crate::state::VmHome;
-use crate::vm::{boot, create_vm, PromptRun, VmConfig};
+use crate::vm::{boot, create_vm, VmConfig};
 
 #[derive(Args)]
 pub struct Create {
@@ -38,19 +38,17 @@ pub struct Create {
     /// Attach to a plain shell in /workspace instead of starting the agent
     #[arg(long)]
     pub shell: bool,
-    /// Headless: run `pi --print` with this prompt file, capture the log,
-    /// then stop the VM (non-interactive only; needs a shared mount)
+    /// Agent prompt (host path): copied into <project>/prompt.txt — the
+    /// guest's timer starts pi in a tmux session 'agent' with that file
+    /// as its first message (pi stays interactive, so `pi-vm send` can
+    /// steer it). Requires a shared project (a --no-mount VM has no
+    /// /workspace for the prompt).
     #[arg(long)]
     pub prompt_file: Option<String>,
-    /// Kill the prompt run after N seconds (exit code 124)
+    /// Stop the VM N seconds after launch (boot time counts against it —
+    /// pass a budget with a boot buffer)
     #[arg(long)]
-    pub timeout: Option<u32>,
-    /// Guest pi --session-dir, a path under /workspace (default .pi-vm/sessions)
-    #[arg(long)]
-    pub session_dir: Option<String>,
-    /// Leave the VM running after the prompt run (pi-vm resume <id>)
-    #[arg(long)]
-    pub keep: bool,
+    pub timeout: Option<u64>,
 }
 
 impl Create {
@@ -63,6 +61,33 @@ impl Create {
             (Some(p), false) => Some(p.clone()),
             _ => None,
         };
+        // Agent mode: the prompt must end up in the shared folder (the
+        // guest reads /workspace/prompt.txt — no ISO delivery involved).
+        // The flag copies it; a hand-placed <project>/prompt.txt also
+        // makes the VM an agent VM (the guest timer triggers on presence).
+        let agent_mode = match &self.prompt_file {
+            Some(pf) => match &project {
+                Some(p) => {
+                    let content = std::fs::read_to_string(pf).unwrap_or_else(|e| {
+                        eprintln!("error: cannot read prompt file {pf}: {e}");
+                        std::process::exit(2);
+                    });
+                    std::fs::write(std::path::Path::new(p).join("prompt.txt"), content)
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: cannot write {p}/prompt.txt: {e}");
+                            std::process::exit(2);
+                        });
+                    true
+                }
+                None => {
+                    eprintln!("error: --prompt-file requires a shared project (the prompt lands in <project>/prompt.txt; a --no-mount VM has no /workspace)");
+                    return 2;
+                }
+            },
+            None => project.as_ref()
+                .map(|p| std::path::Path::new(p).join("prompt.txt").exists())
+                .unwrap_or(false),
+        };
         let kvm = match self.kvm.as_str() {
             "on" => true,
             "off" => false,
@@ -70,25 +95,6 @@ impl Create {
                 eprintln!("error: --kvm must be 'on' or 'off'");
                 return 2;
             }
-        };
-        let prompt = match &self.prompt_file {
-            Some(pf) => {
-                if self.no_mount || project.is_none() {
-                    eprintln!("error: --prompt-file requires a shared mount (a path)");
-                    return 2;
-                }
-                if self.shell {
-                    eprintln!("error: --prompt-file and --shell are contradictory");
-                    return 2;
-                }
-                Some(PromptRun {
-                    prompt_file: pf.clone(),
-                    timeout_s: self.timeout,
-                    session_dir: self.session_dir.clone().unwrap_or_else(|| ".pi-vm/sessions".into()),
-                    keep: self.keep,
-                })
-            }
-            None => None,
         };
         let cfg = VmConfig {
             project,
@@ -108,7 +114,7 @@ impl Create {
                 return 2;
             }
         };
-        match boot(home, meta, attach, self.console, self.shell, prompt) {
+        match boot(home, meta, attach, self.console, self.shell, agent_mode, self.timeout) {
             Ok(code) => code,
             Err(f) => {
                 eprintln!("error: {}", f.msg());

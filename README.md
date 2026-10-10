@@ -17,7 +17,8 @@ docs/       forwarding.md (reaching private/remote services from a VM)
 ## Install / Setup
 
 Requirements:
-- dnf based system (fedora)
+- a dnf-based (Fedora/CachyOS) or apt-based (Ubuntu/Debian) host —
+  `pi-vm install` detects the package manager and maps package names
 - rust toolchain installed
 
 ```
@@ -40,25 +41,36 @@ pi-vm bake [--pi-dir D] [--timeout N]
 pi-vm create [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
               [--extra-disk N] [--kvm on|off] [--squash-uid U] [--no-mount]
               [--console] [--shell] [--prompt-file F] [--timeout N]
-              [--session-dir D] [--keep]
                          new VM from the pre-baked base (no path, or
                          --no-mount, = no shared mount: no virtiofsd, no
                          /workspace in the guest); boots and (if the
                          terminal is interactive) attaches an ssh session
                          that starts in pi (cd /workspace; pi)
-                         --prompt-file F (non-interactive): headless run —
-                         copies F into the mount at .pi-vm/prompt.txt,
-                         runs `pi --print @.pi-vm/prompt.txt` over ssh,
-                         captures stdout in .pi-vm/agent.log, then stops
-                         the VM. --timeout N kills the run after N s
-                         (exit 124; the workspace is on the host, so
-                         partial results survive). --session-dir D sets
-                         the guest pi --session-dir (a path under
-                         /workspace; default .pi-vm/sessions) so the
-                         session lands on the host. --keep leaves the VM
-                         running after the prompt run (pi-vm resume).
-pi-vm resume <id|name> [--console] [--shell]
-                         boot an existing VM and attach
+                         --prompt-file F: F is copied to <path>/prompt.txt
+                         — an AGENT VM: pi-vm starts pi in a tmux
+                         session 'agent' with that file as its first
+                         message (pi stays interactive — steer it with
+                         `pi-vm send`), and the VM powers itself off when
+                         pi exits. A hand-placed <path>/prompt.txt also
+                         makes the VM an agent VM.
+                         --timeout N: stop the VM N seconds after launch
+                         (boot time counts against it)
+pi-vm resume <id|name> [--console] [--shell] [--prompt-file F]
+           [--timeout N]
+                         boot an existing VM and attach; --prompt-file
+                         re-copies the prompt (the disk persists, so a
+                         previous prompt.txt keeps the VM an agent VM)
+pi-vm send <id|name> -m MSG
+                         type MSG into the running VM's agent (the tmux
+                         session 'agent' — agent VMs only); a newline in
+                         MSG becomes a space (a pty newline would submit
+                         early)
+pi-vm fetch <id|name> <guest-path> <host-path>
+                         copy a file or directory from a running VM to
+                         the host (scp -r) — e.g. host-side snapshots
+                         of the agent's pi session dir (pi's default
+                         session dir is guest-local: /root/.pi/agent/
+                         sessions/)
 pi-vm list [-v]         all VMs (docker ps -a style; alias: pi-vm ls)
 pi-vm inspect <id|name> full metadata (meta.json + paths)
 pi-vm logs <id|name> [-f] [-n N]
@@ -100,6 +112,15 @@ pi-vm version           CLI + CH versions, image hashes
   the agent (exiting the shell stops the VM). The disk persists —
   `pi-vm resume` reboots it. Need the VM to outlive your terminal? Run
   `pi-vm` inside tmux.
+- **Agent VMs** — `<project>/prompt.txt` is the trigger: the pi-vm
+  supervisor starts the detached tmux session 'agent' (over ssh, right
+  after ssh-ready — the ssh session context can read the virtiofs
+  /workspace; the systemd context cannot, SELinux virtiofs_t) that runs
+  the baked launch script (pi with the prompt as its first message).
+  Interactive attaches land in that session; `pi-vm send` types into
+  it; the VM powers itself off when pi exits. No ISO delivery is
+  involved — the prompt is read from the shared folder, so it can be
+  updated between boots (the disk + shared folder persist).
 - **Ownership** — files the agent writes in the guest land on the host
   owned by you: virtiofsd squashes every guest uid to one host uid
   (default: the owner of the shared project dir; for `--no-mount` VMs,

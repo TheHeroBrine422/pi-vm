@@ -2,3 +2,4 @@ target
 /pi/*
 !/pi/.gitkeep
 !/pi/AGENTS.md
+pi-vm-autoresearch/

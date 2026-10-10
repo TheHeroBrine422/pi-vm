@@ -78,18 +78,6 @@ pub struct VmConfig {
     pub squash_uid: Option<u32>,
 }
 
-/// A headless pi run inside a freshly booted VM.
-pub struct PromptRun {
-    /// Host path to the prompt file (copied into the mount at .pi-vm/prompt.txt).
-    pub prompt_file: String,
-    /// Kill the run after N seconds (exit code 124).
-    pub timeout_s: Option<u32>,
-    /// Guest --session-dir, a path under /workspace (host path inside the mount).
-    pub session_dir: String,
-    /// Leave the VM running after the prompt run (pi-vm resume <id>).
-    pub keep: bool,
-}
-
 /// Create a new VM: id, meta, ssh key, disk copy + resize.
 pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     // preflight
@@ -260,9 +248,19 @@ pub fn direct_boot_args(home: &VmHome) -> Option<Vec<String>> {
 }
 
 /// Boot the VM and (if attach) drop into ssh. Returns the exit code.
+/// `agent_mode`: the shared project carries a prompt.txt — the guest's
+/// timer starts the tmux session 'agent' (pi with the prompt), and
+/// attaches land in it. `timeout_s`: stop the VM N seconds after launch
+/// (the deadline starts now; boot time counts against it — pass a budget
+/// with a boot buffer).
 pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: bool,
-           prompt: Option<PromptRun>) -> Result<i32, BootFail> {
+           agent_mode: bool, timeout_s: Option<u64>) -> Result<i32, BootFail> {
     let boot_start = std::time::Instant::now();
+    let deadline = timeout_s
+        .map(|s| boot_start + Duration::from_secs(s));
+    if let Some(t) = timeout_s {
+        println!("   timeout: the VM stops {t}s after launch");
+    }
     let _lock = state::VmLock::acquire(&meta, home)
         .map_err(BootFail::InUse)?;
 
@@ -386,8 +384,11 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
         ),
     )
     .map_err(|e| BootFail::Preflight(e.to_string()))?;
-    std::fs::write(nocloud.join("user-data"), user_data(&meta, &pubkey))
-        .map_err(|e| BootFail::Preflight(e.to_string()))?;
+    std::fs::write(
+        nocloud.join("user-data"),
+        user_data(&meta, &pubkey),
+    )
+    .map_err(|e| BootFail::Preflight(e.to_string()))?;
     // ssh-pubkey on the ISO: the baked image's pi-vm-net unit (the
     // cloud-init-independent fallback) installs it the same way the runcmd does.
     std::fs::write(nocloud.join("ssh-pubkey"), format!("{}\n", pubkey))
@@ -605,6 +606,41 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     println!("   boot timing: preflight {:.1}s, guest boot {:.1}s, total {:.1}s to ssh-ready",
         preflight, guest_boot, preflight + guest_boot);
 
+    // Agent mode: start the tmux session 'agent' over ssh. The ssh
+    // session context CAN read the virtiofs /workspace (SELinux
+    // virtiofs_t is denied to the systemd context — a systemd timer
+    // cannot trigger on /workspace/prompt.txt), so the supervisor does
+    // it. ssh-ready implies the /workspace mount is up (the baked
+    // pi-vm-net unit runs Before=sshd and mounts it first).
+    if agent_mode && !shell {
+        let key_s = key.to_string_lossy().into_owned();
+        let start_cmd = "tmux has-session -t agent 2>/dev/null || tmux new-session -d -s agent -f /dev/null \"tmux set status off; PI_VM_SERVICE=1 /usr/local/bin/pi-vm-launch.sh\"";
+        let mut started = false;
+        for _ in 0..3 {
+            let o = Command::new("ssh")
+                .args([
+                    "-i", &key_s,
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=10",
+                    &format!("root@{}", meta.ip),
+                    start_cmd,
+                ])
+                .output();
+            if o.map(|o| o.status.success()).unwrap_or(false) {
+                started = true;
+                break;
+            }
+            thread::sleep(Duration::from_secs(10));
+        }
+        if started {
+            println!("   agent session 'agent' started (pi with the prompt)");
+        } else {
+            eprintln!("   WARN: could not start the agent session — the attach fallback runs the launch script directly");
+        }
+    }
+
     // --- attach or foreground-wait ---
     let code = if attach {
         println!("==> attached — exiting the ssh session stops the VM (Ctrl-C goes to the remote session; SIGTERM stops the VM)");
@@ -624,8 +660,14 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
         // appear in the cwd when the mount lands). Default: the agent.
         // --shell: a plain interactive shell. Exiting the shell (or the
         // agent, then the shell) stops the VM.
+        // Agent VMs: attach to the timer-launched tmux session 'agent'
+        // (the same session `pi-vm send` types into); if the session is
+        // not up after ~20 s (tmux missing, timer race), run the launch
+        // script directly — the user still gets pi, just without send.
         let attach_cmd = if shell {
             "cd /workspace; bash"
+        } else if agent_mode {
+            "cd /workspace; for i in $(seq 1 20); do tmux has-session -t agent 2>/dev/null && break; sleep 1; done; if tmux has-session -t agent 2>/dev/null; then tmux attach -t agent; else /usr/local/bin/pi-vm-launch.sh; fi"
         } else {
             "cd /workspace; pi"
         };
@@ -648,8 +690,14 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
                 1
             }
             Ok(mut ssh) => loop {
-                if terminated.load(Ordering::Relaxed) {
-                    eprintln!("SIGTERM — stopping the ssh session and the VM");
+                let timed_out = deadline
+                    .map(|d| std::time::Instant::now() >= d)
+                    .unwrap_or(false);
+                if timed_out && !terminated.load(Ordering::Relaxed) {
+                    eprintln!("timeout — stopping the VM");
+                }
+                if terminated.load(Ordering::Relaxed) || timed_out {
+                    eprintln!("stopping the ssh session and the VM");
                     libc_kill(ssh.id(), 15);
                 }
                 match ssh.try_wait() {
@@ -663,123 +711,27 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             },
         }
     } else {
-        // non-interactive: optional headless prompt run, then run until CH
-        // exits or we're interrupted (or the prompt run finished and !keep)
-        let mut prompt_code: Option<i32> = None;
-        let mut keep = false;
-        if let Some(pr) = prompt {
-            match run_prompt_run(&meta, &pr, &key, &interrupted, &terminated) {
-                Ok(c) => {
-                    println!("==> prompt run finished (code {c})");
-                    prompt_code = Some(c);
-                    keep = pr.keep;
-                    if pr.keep {
-                        println!("==> VM kept running — reconnect: pi-vm resume {}", meta.id);
-                    }
-                }
-                Err(f) => {
-                    teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock);
-                    return Err(f);
-                }
+        // non-interactive: run until CH exits, the timeout fires, or we're
+        // interrupted
+        println!("==> running in foreground (Ctrl-C stops the VM)");
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
+                break;
+            }
+            if deadline.map(|d| std::time::Instant::now() >= d).unwrap_or(false) {
+                eprintln!("timeout — stopping the VM");
+                break;
+            }
+            if ch_child.try_wait().ok().flatten().is_some() {
+                break;
             }
         }
-        if prompt_code.is_none() || keep {
-            if prompt_code.is_none() {
-                println!("==> running in foreground (Ctrl-C stops the VM)");
-            }
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
-                    break;
-                }
-                if ch_child.try_wait().ok().flatten().is_some() {
-                    break;
-                }
-            }
-            0
-        } else {
-            prompt_code.unwrap()
-        }
+        0
     };
 
     teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock);
     Ok(code)
-}
-
-/// Headless prompt run: copy the prompt into the mount, run
-/// `pi --print @prompt` over ssh (with the session dir), capture stdout
-/// in the mount's .pi-vm/agent.log, and return the exit code. A timeout
-/// kills the ssh client (the remote pi gets SIGHUP) -> 124. Interrupted
-/// -> 130. The workspace is on the host, so a killed run still preserves
-/// everything the agent wrote before the kill.
-fn run_prompt_run(meta: &VmMeta, pr: &PromptRun, key: &std::path::Path,
-                  interrupted: &Arc<AtomicBool>, terminated: &Arc<AtomicBool>)
-    -> Result<i32, BootFail> {
-    let project = meta.project.as_ref().ok_or_else(|| BootFail::Preflight(
-        "a prompt run requires a shared mount (a path)".into()))?;
-    let pdir = std::path::Path::new(project).join(".pi-vm");
-    std::fs::create_dir_all(&pdir)
-        .map_err(|e| BootFail::Other(format!("create .pi-vm dir: {e}")))?;
-    std::fs::copy(&pr.prompt_file, pdir.join("prompt.txt"))
-        .map_err(|e| BootFail::Other(format!("copy prompt file: {e}")))?;
-    let session_host = std::path::Path::new(project).join(&pr.session_dir);
-    std::fs::create_dir_all(&session_host)
-        .map_err(|e| BootFail::Other(format!("create session dir: {e}")))?;
-    let log_path = pdir.join("agent.log");
-    let log = std::fs::File::create(&log_path)
-        .map_err(|e| BootFail::Other(format!("create agent.log: {e}")))?;
-
-    let cmd = format!(
-        "cd /workspace && mkdir -p {} && pi --session-dir {} --print @.pi-vm/prompt.txt",
-        pr.session_dir, pr.session_dir
-    );
-    let mut ssh = Command::new("ssh");
-    ssh.arg("-i")
-        .arg(key.to_string_lossy().to_string())
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(format!("root@{}", meta.ip))
-        .arg(cmd)
-        .stdout(log)
-        .stderr(Stdio::inherit());
-    with_pdeathsig(&mut ssh);
-    let mut child = ssh
-        .spawn()
-        .map_err(|e| BootFail::Other(format!("ssh prompt run failed: {e}")))?;
-
-    let t0 = std::time::Instant::now();
-    loop {
-        if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
-            eprintln!("interrupted — stopping the prompt run");
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(130);
-        }
-        match child.try_wait() {
-            Ok(Some(s)) => return Ok(s.code().unwrap_or(0)),
-            Ok(None) => {
-                if let Some(t) = pr.timeout_s {
-                    if t0.elapsed() >= Duration::from_secs(t as u64) {
-                        eprintln!("prompt run timed out after {t}s — killing");
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Ok(124);
-                    }
-                }
-                thread::sleep(Duration::from_millis(200));
-            }
-            Err(e) => {
-                eprintln!("ssh prompt run failed: {e}");
-                return Ok(1);
-            }
-        }
-    }
 }
 
 /// Teardown: graceful GUEST poweroff (ssh `systemctl poweroff`) up to 120 s,
@@ -1148,21 +1100,26 @@ mod tests {
     /// `: ` sequences, no ` #` sequences (a `#` at line start or after a
     /// space terminates the scalar — comments are NOT allowed in the
     /// block), and exactly one opening + one closing single quote.
-    #[test]
-    fn user_data_runcmd_blocks_are_valid_yaml() {
-        let s = user_data(&test_meta(), "ssh-ed25519 AAAA test");
+    fn assert_valid_yaml(s: &str, expected_entries: usize) {
         let entries: Vec<&str> = s
             .split("  - ")
             .map(|e| e.trim_start())
             .filter(|e| e.starts_with("bash -c '"))
             .collect();
-        assert_eq!(entries.len(), 5, "expected 5 runcmd entries (net, ssh, grow, mount, extra)");
+        assert_eq!(entries.len(), expected_entries,
+            "expected {expected_entries} runcmd entries, got {}", entries.len());
         for e in &entries {
             assert!(!e.contains(": "), "runcmd entry contains ': ' (breaks the YAML plain scalar): {}", e.chars().take(80).collect::<String>());
             assert!(!e.contains(" #"), "runcmd entry contains ' #' (starts a comment, breaks the YAML plain scalar): {}", e.chars().take(80).collect::<String>());
             assert_eq!(e.matches('\'').count(), 2, "unbalanced single quotes: {}", e.chars().take(80).collect::<String>());
         }
     }
-}
 
+    #[test]
+    fn user_data_runcmd_blocks_are_valid_yaml() {
+        let s = user_data(&test_meta(), "ssh-ed25519 AAAA test");
+        // 5 base entries (net, ssh, grow, mount, extra)
+        assert_valid_yaml(&s, 5);
+    }
+}
 

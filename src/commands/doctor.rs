@@ -6,7 +6,7 @@ use std::process::Command;
 use clap::Args;
 
 use crate::state::VmHome;
-use crate::util::virtiofsd_path;
+use crate::util::{run_ok, virtiofsd_path};
 
 #[derive(Args)]
 pub struct Doctor {
@@ -41,16 +41,21 @@ impl Doctor {
             },
         });
 
-        // required host binaries (virtiofsd is checked separately — see virtiofsd_path)
-        for (bin, hint) in [
-            ("genisoimage", "dnf install genisoimage"),
-            ("guestfish", "dnf install libguestfs"),
-            ("ssh", "dnf install openssh-clients"),
-            ("ip", "dnf install iproute"),
-            ("iptables", "dnf install iptables"),
-            ("qemu-img", "dnf install qemu-img"),
-            ("ssh-keygen", "dnf install openssh"),
-        ] {
+        // required host binaries (virtiofsd is checked separately — see virtiofsd_path).
+        // Hints are per-distro (dnf: Fedora/CachyOS; apt: Ubuntu/Debian).
+        let pm = if run_ok("which", &["dnf"]) { "dnf" } else { "apt" };
+        // (binary, dnf package, apt package)
+        let specs: [(&str, &str, &str); 7] = [
+            ("genisoimage", "genisoimage", "genisoimage"),
+            ("guestfish", "libguestfs", "libguestfs-tools"),
+            ("ssh", "openssh-clients", "openssh-client"),
+            ("ip", "iproute", "iproute2"),
+            ("iptables", "iptables", "iptables"),
+            ("qemu-img", "qemu-img", "qemu-utils"),
+            ("ssh-keygen", "openssh", "openssh-client"),
+        ];
+        for (bin, dnf_pkg, apt_pkg) in specs {
+            let pkg = if pm == "dnf" { dnf_pkg } else { apt_pkg };
             let which = Command::new("which")
                 .arg(bin)
                 .output()
@@ -59,18 +64,19 @@ impl Doctor {
             c.push(Check {
                 name: bin,
                 ok: which,
-                detail: if which { "installed".into() } else { format!("missing — {hint}") },
+                detail: if which { "installed".into() } else { format!("missing — {pm} install {pkg}") },
             });
         }
 
         // virtiofsd (may live in /usr/libexec, not PATH)
         let vf_path = virtiofsd_path();
+        let vf_pkg = if pm == "dnf" { "virtiofsd" } else { "virtiofsd" };
         c.push(Check {
             name: "virtiofsd",
             ok: vf_path.is_some(),
             detail: match vf_path {
                 Some(p) => format!("installed at {p}"),
-                None => "missing — dnf install virtiofsd".into(),
+                None => format!("missing — {pm} install {vf_pkg}").into(),
             },
         });
 

@@ -33,12 +33,13 @@ impl Install {
             return rc;
         }
 
-        if !run_ok("which", &["dnf"]) {
-            eprintln!("error: expected a dnf-based host (CachyOS/Fedora)");
+        if !run_ok("which", &["dnf"]) && !run_ok("which", &["apt-get"]) {
+            eprintln!("error: no supported package manager (dnf or apt-get) found");
             return 2;
         }
 
-        self.packages();
+        let pm = if run_ok("which", &["dnf"]) { "dnf" } else { "apt" };
+        self.packages(pm);
         self.ch_binary(home);
         self.nested_kvm();
         self.cloud_image(home);
@@ -49,45 +50,84 @@ impl Install {
         0
     }
 
-    fn packages(&self) {
+    /// Host packages. Detected per distro (dnf: Fedora/CachyOS; apt: Ubuntu/Debian).
+    /// Missing-ness is checked by BINARY name (distro-independent); the
+    /// package name is mapped per distro.
+    fn packages(&self, pm: &str) {
         println!("==> [1/4] host packages (virtiofsd, cloud-init, genisoimage, iproute, qemu-img, iptables, libguestfs)");
-        let pkgs = ["virtiofsd", "cloud-init", "genisoimage", "iproute", "qemu-img", "iptables", "libguestfs"];
-        let missing: Vec<&str> = pkgs
+        // (binary to check, dnf package, apt package)
+        let specs: [(&str, &str, &str); 7] = [
+            ("virtiofsd", "virtiofsd", "virtiofsd"),
+            ("cloud-init", "cloud-init", "cloud-init"),
+            ("genisoimage", "genisoimage", "genisoimage"),
+            ("ip", "iproute", "iproute2"),
+            ("qemu-img", "qemu-img", "qemu-utils"),
+            ("iptables", "iptables", "iptables"),
+            ("guestfish", "libguestfs", "libguestfs-tools"),
+        ];
+        let missing: Vec<String> = specs
             .iter()
-            .filter(|p| {
-                if **p == "virtiofsd" {
+            .filter(|(bin, _, _)| {
+                if *bin == "virtiofsd" {
                     virtiofsd_path().is_none()
                 } else {
-                    !run_ok("which", &[**p])
+                    !run_ok("which", &[*bin])
                 }
-            }).copied()
+            })
+            .map(|(_, dnf, apt)| if pm == "dnf" { dnf.to_string() } else { apt.to_string() })
             .collect();
         if missing.is_empty() {
             println!("   all packages already installed");
             return;
         }
         println!("   installing: {}", missing.join(", "));
-        let mut args: Vec<String> = vec!["dnf".into(), "install".into(), "-y".into()];
-        args.extend(missing.iter().map(|s| s.to_string()));
-        // privileged (auto-sudo when not root); a failure ABORTS (v1's behavior)
-        let status = if crate::util::is_root() {
-            std::process::Command::new(&args[0]).args(&args[1..]).status()
+        if pm == "apt" {
+            // best effort: a stale index is the usual apt install failure
+            self.priv_run(&["apt-get", "update", "-qq"]);
+        }
+        let mut args: Vec<String> = if pm == "dnf" {
+            vec!["dnf".into(), "install".into(), "-y".into()]
         } else {
-            let mut sa: Vec<String> = vec!["sudo".into()];
-            sa.extend(args);
-            std::process::Command::new(&sa[0]).args(&sa[1..]).status()
+            vec!["apt-get".into(),
+                "-o".into(), "DEBIAN_FRONTEND=noninteractive".into(),
+                "install".into(), "-y".into()]
         };
+        args.extend(missing);
+        // privileged (auto-sudo when not root); a failure ABORTS (v1's behavior)
+        let status = self.priv_status(&args);
         match status {
             Ok(s) if s.success() => println!("   installed"),
             Ok(s) => {
-                eprintln!("   ERROR: dnf install exited with {s} — re-run `pi-vm install`");
+                eprintln!("   ERROR: {pm} install exited with {s} — re-run `pi-vm install`");
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!("   ERROR: dnf install: {e} — re-run `pi-vm install`");
+                eprintln!("   ERROR: {pm} install: {e} — re-run `pi-vm install`");
                 std::process::exit(1);
             }
         }
+    }
+
+    /// Run a command, auto-sudo when not root (status only).
+    fn priv_status(&self, args: &[String]) -> std::io::Result<std::process::ExitStatus> {
+        if crate::util::is_root() {
+            std::process::Command::new(&args[0]).args(&args[1..]).status()
+        } else {
+            let mut sa: Vec<String> = vec!["sudo".into()];
+            sa.extend(args.iter().cloned());
+            std::process::Command::new(&sa[0]).args(&sa[1..]).status()
+        }
+    }
+
+    /// Run a best-effort command (auto-sudo when not root).
+    fn priv_run(&self, args: &[&str]) {
+        let mut full: Vec<String> = if crate::util::is_root() {
+            vec![args[0].to_string()]
+        } else {
+            vec!["sudo".to_string(), args[0].to_string()]
+        };
+        full.extend(args[1..].iter().map(|s| s.to_string()));
+        let _ = self.priv_status(&full);
     }
 
     fn ch_binary(&self, home: &VmHome) {
