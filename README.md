@@ -63,7 +63,8 @@ pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
                          --rm: when the VM stops normally (the attach
                          session ends, or --timeout fires), delete it
                          (disk + state + network) instead of leaving it
-                         stopped; a failed boot does not delete it
+                         stopped; a failed boot or a failed attach does
+                         not delete it
 pi-vm resume <id|name> [--console] [--shell] [--prompt-file F]
            [--timeout N] [--rm]
                          boot an existing VM and attach; --prompt-file

@@ -694,6 +694,14 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     }
 
     // --- attach or foreground-wait ---
+    // `attach_failed`: the attach ssh session did not run normally (spawn
+    // failed, or ssh exited on its own with an error — a transient
+    // connection/auth hiccup). A normal stop (user exit, or the timeout /
+    // SIGTERM kill of the session — `stop_announced`) is NOT a failure.
+    // A failed attach must surface as Err (exit 1, same as before): the
+    // --rm auto-delete skips Err, so an Ok(1) here would delete the VM
+    // after a transient ssh hiccup.
+    let mut attach_failed = false;
     let code = if attach {
         println!("==> attached — exiting the ssh session stops the VM (Ctrl-C goes to the remote session; SIGTERM stops the VM)");
         let key_s = key.to_string_lossy().into_owned();
@@ -744,36 +752,46 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             .spawn()
         {
             Err(e) => {
-                eprintln!("ssh attach failed: {e} — the VM is still running; reconnect with `pi-vm resume {}`", meta.id);
+                eprintln!("ssh attach failed: {e}");
+                attach_failed = true;
                 1
             }
             Ok(mut ssh) => {
                 let mut stop_announced = false;
                 loop {
-                if tstp.swap(false, Ordering::Relaxed) {
-                    eprintln!("{SIGTSTP_HINT}");
-                }
-                let timed_out = deadline
-                    .map(|d| std::time::Instant::now() >= d)
-                    .unwrap_or(false);
-                if terminated.load(Ordering::Relaxed) || timed_out {
-                    if !stop_announced {
-                        if timed_out {
-                            eprintln!("timeout — stopping the VM");
+                    if tstp.swap(false, Ordering::Relaxed) {
+                        eprintln!("{SIGTSTP_HINT}");
+                    }
+                    let timed_out = deadline
+                        .map(|d| std::time::Instant::now() >= d)
+                        .unwrap_or(false);
+                    if terminated.load(Ordering::Relaxed) || timed_out {
+                        if !stop_announced {
+                            if timed_out {
+                                eprintln!("timeout — stopping the VM");
+                            }
+                            eprintln!("stopping the ssh session and the VM");
+                            stop_announced = true;
                         }
-                        eprintln!("stopping the ssh session and the VM");
-                        stop_announced = true;
+                        libc_kill(ssh.id(), 15);
                     }
-                    libc_kill(ssh.id(), 15);
-                }
-                match ssh.try_wait() {
-                    Ok(Some(s)) => break s.code().unwrap_or(0),
-                    Ok(None) => thread::sleep(Duration::from_millis(200)),
-                    Err(e) => {
-                        eprintln!("ssh attach failed: {e} — the VM is still running; reconnect with `pi-vm resume {}`", meta.id);
-                        break 1;
+                    match ssh.try_wait() {
+                        Ok(Some(s)) => {
+                            let c = s.code().unwrap_or(0);
+                            if c != 0 && !stop_announced {
+                                // ssh died on its own (not our timeout/SIGTERM
+                                // kill) — a transient failure, not a normal stop.
+                                attach_failed = true;
+                            }
+                            break c;
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(200)),
+                        Err(e) => {
+                            eprintln!("ssh attach failed: {e}");
+                            attach_failed = true;
+                            break 1;
+                        }
                     }
-                }
                 }
             },
         }
@@ -801,6 +819,14 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     };
 
     teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
+    if attach_failed {
+        // The VM was stopped by the teardown above (the disk persists).
+        // Err — not Ok(1) — so a --rm caller does not delete it.
+        return Err(BootFail::Other(format!(
+            "ssh attach failed — the VM is stopped; reconnect with `pi-vm resume {}`",
+            meta.id
+        )));
+    }
     Ok(code)
 }
 

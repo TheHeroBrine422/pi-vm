@@ -27,8 +27,8 @@ pub struct Resume {
     pub timeout: Option<u64>,
     /// Delete the VM (disk + state + network) when it stops normally
     /// (the attach session ends, or --timeout fires) instead of leaving
-    /// it stopped. A failed boot does NOT delete it (investigate with
-    /// `pi-vm logs` / `pi-vm resume`).
+    /// it stopped. A failed boot or a failed attach session does NOT
+    /// delete it (investigate with `pi-vm logs` / `pi-vm resume`).
     #[arg(long)]
     pub rm: bool,
 }
@@ -70,10 +70,12 @@ impl Resume {
         match boot(home, meta, attach, self.console, self.shell, agent_mode, self.timeout, self.rm) {
             Ok(code) => {
                 if self.rm {
-                    // Normal stop (attach session ended, or --timeout fired):
-                    // delete via the rm logic (lock is free — boot released
-                    // it). force=true: the teardown already killed the
-                    // children; the running-check is belt-and-braces.
+                    // Only a normal stop reaches here (attach session ended,
+                    // or --timeout fired): a failed boot AND a failed attach
+                    // session return Err from boot, so the VM is not
+                    // deleted. Delete via the rm logic (lock is free — boot
+                    // released it). force=true: the teardown already killed
+                    // the children; the running-check is belt-and-braces.
                     let name = rm_meta.name.as_deref().unwrap_or(&rm_meta.id);
                     println!("==> --rm: deleting VM {name} (disk + state + network)");
                     if crate::commands::rm::delete_vm(home, &rm_meta, true) != 0 {
