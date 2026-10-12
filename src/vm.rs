@@ -6,7 +6,9 @@
 //!   - ssh        -> foreground child that inherits the terminal (M2 attach)
 //!
 //! VM lifetime = this process's lifetime. Exiting the ssh session (Ctrl-C
-//! while booting, or SIGTERM in any state) runs the teardown: graceful
+//! while booting, or Ctrl-C/SIGTERM in any state — a Ctrl-C while attached goes
+//! to the guest first and becomes a clean stop if it takes the ssh client
+//! down) runs the teardown: graceful
 //! guest poweroff -> SIGTERM -> SIGKILL -> kill virtiofsd -> delete the
 //! bridge/tap/iptables.
 //!
@@ -254,16 +256,18 @@ pub fn direct_boot_args(home: &VmHome) -> Option<Vec<String>> {
 fn attach_title(meta: &VmMeta) -> String {
     let id8: String = meta.id.chars().take(8).collect();
     let mut title = format!("pi-vm {id8}");
-    if let Some(p) = &meta.project {
-        if let Some(base) = std::path::Path::new(p)
-            .components()
-            .last()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .filter(|b| !b.is_empty())
-        {
-            title.push(' ');
-            title.push_str(&base);
-        }
+    if let Some(base) = meta.project
+        .as_ref()
+        .and_then(|p| {
+            std::path::Path::new(p)
+                .components()
+                .next_back()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        })
+        .filter(|b| !b.is_empty())
+    {
+        title.push(' ');
+        title.push_str(&base);
     }
     title
 }
@@ -453,6 +457,13 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     // stops and doesn't leak (unflushed guest data may be lost — PLAN.md §3b.3).
     // (2) pi-vm itself gets PR_SET_PDEATHSIG, so a dead shell (the terminal
     // is closed) SIGTERMs pi-vm -> the SIGTERM handler tears down.
+    // (3) The VM daemons (CH, virtiofsd) are additionally setsid()'d out of
+    // the terminal's process group (with_pdeathsig_isolated): a Ctrl-C
+    // reaches only pi-vm (whose handler runs the graceful stop) and ssh
+    // (which forwards it to the guest session), never the daemons —
+    // CH's own SIGINT handler is an immediate hard exit, and virtiofsd's
+    // default SIGINT disposition would drop the guest's /workspace mount,
+    // both before pi-vm's handler could act.
     set_pdeathsig();
     let squash = meta.squash_uid;
     let mut vfs_child: Option<Child> = match &meta.project {
@@ -475,7 +486,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
             cmd.stdin(Stdio::null());
             cmd.stdout(vfs_log.try_clone().unwrap());
             cmd.stderr(vfs_log); // v1: both streams to the log (not the user's terminal)
-            with_pdeathsig(&mut cmd);
+            with_pdeathsig_isolated(&mut cmd);
             let mut child = cmd
                 .spawn()
                 .map_err(|e| BootFail::Preflight(format!("spawn virtiofsd: {e}")))?;
@@ -532,7 +543,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     ch_cmd.stdin(Stdio::null());
     ch_cmd.stdout(console_file.try_clone().unwrap());
     ch_cmd.stderr(console_file);
-    with_pdeathsig(&mut ch_cmd);
+    with_pdeathsig_isolated(&mut ch_cmd);
     let mut ch_child = match ch_cmd.spawn()
     {
         Ok(c) => c,
@@ -569,11 +580,14 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
 
     // Signal handling: Ctrl-C (SIGINT) and SIGTERM set separate flags.
     // Ctrl-C interrupts the boot-wait only (while attached it goes to the
-    // remote session); SIGTERM tears down in every state. Ctrl-Z (SIGTSTP)
+    // remote session via ssh — and becomes a clean stop only if that Ctrl-C
+    // takes the ssh client down); SIGTERM tears down in every state.
+    // Ctrl-Z (SIGTSTP)
     // sets a flag the wait loops turn into a one-line hint — the default
     // suspend action is replaced, so Ctrl-Z no longer hangs the session
-    // (the children ignore SIGTSTP themselves — see child_pdeathsig —
-    // because the terminal sends it to the whole foreground group).
+    // (the VM daemons ignore SIGTSTP/SIGINT themselves — see
+    // child_pdeathsig_isolated — because the terminal sends them to the
+    // whole foreground group).
     let interrupted = Arc::new(AtomicBool::new(false));
     let terminated = Arc::new(AtomicBool::new(false));
     let tstp = Arc::new(AtomicBool::new(false));
@@ -709,9 +723,12 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
         // Poll rather than block on status(): a SIGTERM to the supervisor
         // must tear the VM down even while attached (the old blocking
         // status() made `kill <pi-vm-pid>` a no-op — the flag was set but
-        // never checked). Ctrl-C (SIGINT) is deliberately NOT checked here:
-        // the terminal delivers it to the foreground group and ssh forwards
-        // it to the remote session (docker-attach semantics).
+        // never checked). Ctrl-C (SIGINT) is NOT a stop here: the terminal
+        // delivers it to the foreground group and the live ssh forwards it
+        // to the remote session; if that Ctrl-C takes the ssh client down
+        // (exit 255 within 30 s of the Ctrl-C), the 255 branch treats it
+        // as a clean stop (docker-attach-ish: the interrupt reaches the
+        // guest first, then the VM stops cleanly).
         match ssh
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -724,11 +741,22 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
                 1
             }
             Ok(mut ssh) => {
-                let mut stop_announced = false; // we killed ssh (timeout / SIGTERM)
+                let mut stop_announced = false; // we killed ssh (timeout / SIGTERM / Ctrl-C)
                 let mut guest_stopped = false; // CH exited on its own (guest poweroff)
+                let mut ctrl_c_at: Option<std::time::Instant> = None; // last Ctrl-C during attach
                 loop {
                     if tstp.swap(false, Ordering::Relaxed) {
                         eprintln!("{SIGTSTP_HINT}");
+                    }
+                    if interrupted.swap(false, Ordering::Relaxed) {
+                        // Ctrl-C during attach: the terminal also delivers
+                        // it to the live ssh, which forwards it to the
+                        // guest session — so it does NOT stop the VM here.
+                        // If that Ctrl-C takes the ssh client down (exit
+                        // 255), the 255 branch below (within a short
+                        // window) treats it as a clean stop instead of the
+                        // 120 s failure grace period.
+                        ctrl_c_at = Some(std::time::Instant::now());
                     }
                     let timed_out = deadline
                         .map(|d| std::time::Instant::now() >= d)
@@ -759,6 +787,19 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
                         Ok(Some(s)) => {
                             let c = s.code().unwrap_or(0);
                             if c == 255 && !stop_announced && !guest_stopped {
+                                // A Ctrl-C within the last 30 s: the user
+                                // interrupted the session — ssh forwarded it
+                                // to the guest, then the ssh client exited
+                                // on the signal. A clean stop, not a failure
+                                // (the grace period below is for TRANSIENT
+                                // failures with no user intent).
+                                if ctrl_c_at
+                                    .map(|t| t.elapsed() <= Duration::from_secs(30))
+                                    .unwrap_or(false)
+                                {
+                                    eprintln!("interrupted (Ctrl-C) — stopping the VM");
+                                    stop_announced = true;
+                                } else {
                                 // 255 = an ssh TRANSPORT failure (connection /
                                 // auth — a remote session ending with status
                                 // 1-254 is a normal end, docker-like).
@@ -777,6 +818,18 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
                                 let deadline = t0 + Duration::from_secs(120);
                                 let mut hint_printed = false;
                                 loop {
+                                    // A SIGTERM to the supervisor ends the
+                                    // grace wait immediately and takes the
+                                    // normal-stop path (the signal is
+                                    // authoritative — the ssh 255 it caused
+                                    // is not a failure). (Catches the race
+                                    // where ssh's own signal-exit is reaped
+                                    // before the handler flags `terminated`.)
+                                    if terminated.load(Ordering::Relaxed) {
+                                        eprintln!("interrupted — stopping the VM");
+                                        stop_announced = true;
+                                        break;
+                                    }
                                     if ch_child.try_wait().ok().flatten().is_some() {
                                         guest_stopped = true;
                                         break;
@@ -791,6 +844,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
                                         hint_printed = true;
                                     }
                                     thread::sleep(Duration::from_millis(500));
+                                }
                                 }
                             }
                             if c == 255 && !stop_announced && !guest_stopped {
@@ -999,17 +1053,69 @@ fn child_pdeathsig() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Like `child_pdeathsig`, but additionally detaches the child from the
+/// supervisor's process group (`setsid`) and ignores SIGINT — used for
+/// the VM daemons (cloud-hypervisor, virtiofsd), NOT for ssh.
+///
+/// Why: a Ctrl-C at the terminal delivers SIGINT to the whole foreground
+/// process group. The daemons must not act on it:
+/// - CH installs its own SIGINT handler, which exits *immediately* (a
+///   hard power-off — no guest shutdown, verified empirically);
+/// - virtiofsd has the default disposition (death) — the guest's
+///   /workspace mount would vanish mid-session.
+///
+/// Both would happen before pi-vm's handler runs the graceful stop.
+/// `setsid()` removes the daemons from the terminal's group, so a Ctrl-C
+/// reaches only pi-vm (graceful handler) and ssh (which deliberately STAYS
+/// in the group: it must forward the Ctrl-C to the guest session).
+///
+/// The `SIGINT=SIG_IGN` mask is defense in depth: it covers signals aimed
+/// at the daemons' own (new) group. CH overrides the mask with its own
+/// handler at startup — that is fine, since it is no longer in the
+/// terminal's group; virtiofsd keeps the ignore (it installs no handler).
+/// The setsid() call fails only if the child were already a
+/// process-group leader, which a plain fork() child never is; on that
+/// (impossible) failure the signal mask still applies.
+fn child_pdeathsig_isolated() -> std::io::Result<()> {
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn prctl(option: i32, arg2: i32) -> i32;
+        fn signal(signum: i32, handler: usize) -> usize;
+        fn setsid() -> i32;
+    }
+    #[cfg(unix)]
+    unsafe {
+        if prctl(1, 15) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        setsid(); // detach from the supervisor's process group (see docs)
+        signal(signal_hook::consts::SIGTSTP, 1); // SIG_IGN
+        signal(signal_hook::consts::SIGINT, 1);  // SIG_IGN
+    }
+    Ok(())
+}
+
 /// Attach child_pdeathsig to a spawn. (pre_exec is Unix-only; the stub
 /// keeps non-Unix builds compiling — the tool itself is Linux-oriented.)
 #[cfg(unix)]
 pub fn with_pdeathsig(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     unsafe {
-        cmd.pre_exec(|| child_pdeathsig());
+        cmd.pre_exec(child_pdeathsig);
     }
 }
 #[cfg(not(unix))]
 pub fn with_pdeathsig(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+pub fn with_pdeathsig_isolated(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(child_pdeathsig_isolated);
+    }
+}
+#[cfg(not(unix))]
+pub fn with_pdeathsig_isolated(_cmd: &mut Command) {}
 
 /// Send an arbitrary signal to a pid (Child::kill only sends SIGKILL).
 #[cfg(unix)]
@@ -1342,6 +1448,50 @@ mod tests {
         let mut m = test_meta();
         m.project = None;
         assert_eq!(attach_title(&m), "pi-vm testtest");
+    }
+
+    /// H1 regression: the VM-daemon hook must detach the child from the
+    /// caller's process group (setsid) and ignore group-directed SIGINT /
+    /// SIGTSTP — a terminal Ctrl-C must never reach cloud-hypervisor
+    /// (whose own SIGINT handler is an immediate hard exit) or virtiofsd
+    /// (whose default SIGINT disposition would drop the guest's
+    /// /workspace mount).
+    #[test]
+    fn child_isolation_hook_detaches_group_and_ignores_ctrl_c() {
+        use super::with_pdeathsig_isolated;
+        unsafe extern "C" {
+            fn getpgid(pid: i32) -> i32;
+            fn getpgrp() -> i32;
+        }
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        with_pdeathsig_isolated(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id();
+        // give pre_exec (setsid) time to run before exec
+        thread::sleep(Duration::from_millis(300));
+        let child_pgid = unsafe { getpgid(pid as i32) };
+        assert_eq!(child_pgid, pid as i32, "child must be in its own process group (setsid)");
+        assert_ne!(child_pgid, unsafe { getpgrp() }, "child must have left the caller's group");
+        // a signal aimed at the child's own group (which contains only the
+        // child) must be ignored, not fatal
+        super::libc_kill(child_pgid as u32, 2); // SIGINT
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            child.try_wait().ok().flatten().is_none(),
+            "child died from a group SIGINT — the isolation hook is not applied"
+        );
+        super::libc_kill(child_pgid as u32, 20); // SIGTSTP
+        thread::sleep(Duration::from_millis(300));
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid))
+            .expect("read /proc stat");
+        let state = stat.rsplit(')').nth(1).expect("stat state field").chars().next().expect("state char");
+        assert_ne!(state, 'T', "child stopped on a group SIGTSTP");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

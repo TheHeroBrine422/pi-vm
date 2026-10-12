@@ -194,22 +194,28 @@ pi-vm version           CLI + CH versions, image hashes
   (30 s cap, then SIGTERM → SIGKILL fallback). The only data-loss paths
   are a forced stop (the guest fails to power off within the 120 s window,
   or a manual kill of the process).
-- **What does Ctrl-C do?** Ctrl-C works while booting. Once attached it
-  goes to the remote session (docker-attach semantics), and the VM stops
-  when the ssh session ends — for the default attach, when you exit `pi`
-  — via a graceful guest poweroff. For non-interactive runs, Ctrl-C/SIGTERM
-  interrupts (exit 130) and tears the VM down the same graceful way. The
-  disk is left intact for `pi-vm resume`. `kill <pi-vm-pid>` (SIGTERM)
-  works in every state — while attached it stops the ssh session and tears
-  the VM down the same graceful way; a SIGTERM stop of an attached --rm
-  VM counts as a normal stop (the VM is deleted). `kill -9` no longer orphans the VM
-  either: every child carries PR_SET_PDEATHSIG, so a dead supervisor
-  SIGTERMs CH (immediate host-side poweroff) + virtiofsd + the ssh client.
+- **What does Ctrl-C do?** Ctrl-C works while booting (exit 130: the VM is
+  torn down the graceful way, the disk is left intact for `pi-vm resume`).
+  Once attached it goes to the remote session first (docker-attach
+  semantics) — the ssh client then exits on the signal (130, propagated
+  like any remote status), the VM stops the same graceful way, and the
+  disk persists for `pi-vm resume` (a `--rm` VM is deleted — a stop is a
+  stop). In short: while attached, Ctrl-C = interrupt the guest, then
+  stop the VM — reconnect with `pi-vm resume` to continue. For
+  non-interactive runs, Ctrl-C/SIGTERM interrupts (exit 130) and tears the
+  VM down the same graceful way. The disk is left intact for `pi-vm
+  resume`. `kill <pi-vm-pid>` (SIGTERM) works in every state — while
+  attached it stops the ssh session and tears the VM down the same
+  graceful way; a SIGTERM stop of an attached --rm VM counts as a normal
+  stop (the VM is deleted). `kill -9` no longer orphans the VM either:
+  every child carries PR_SET_PDEATHSIG, so a dead supervisor SIGTERMs CH
+  (immediate host-side poweroff) + virtiofsd + the ssh client.
 - **What does Ctrl-Z do?** It is caught and ignored (you get a one-line
   hint): pi-vm does not suspend, so the VM and the attached ssh session
-  stay up (the children ignore SIGTSTP too). Stop the VM by exiting the
-  guest session — Ctrl-C while attached goes to the remote session, as
-  usual; while booting or in a non-interactive run, Ctrl-C stops the VM.
+  stay up (the VM daemons ignore SIGTSTP too). Stop the VM by exiting the
+  guest session — Ctrl-C while attached interrupts the guest session and
+  then stops the VM (see above); while booting or in a non-interactive
+  run, Ctrl-C stops the VM (exit 130).
 - **Why does ssh take a while to come up?** The baked `pi-vm-net` unit
   runs a convergence loop (up to 60 s) that brings up the network + ssh as
   soon as the underlying devices are ready, in parallel with sshd, and
