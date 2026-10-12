@@ -586,7 +586,6 @@ const NET_SCRIPT: &str = r#"#!/bin/sh
 #
 # The checks:
 #   1. virtiofs mount  -> /workspace (the shared dir; N/A for --no-mount)
-#   2. extra disk      -> /mnt/extra (N/A when --extra-disk is unset)
 #   3. NoCloud ISO     -> /mnt/nocloud (provides the network + ssh config)
 #   4. network         -> ip/link/route from the ISO's meta-data
 #   5. ssh             -> pubkey from the ISO + sshd running
@@ -596,7 +595,6 @@ mkdir -p /workspace /mnt/nocloud
 
 # per-item "done" flags (1 = converged or not-applicable)
 vfs_done=0; vfs_fails=0
-extra_done=0
 iso_done=0
 net_done=0
 ssh_done=0
@@ -614,28 +612,6 @@ for i in $(seq 1 60); do
     else
       vfs_fails=$((vfs_fails + 1))
       [ "$vfs_fails" -ge 15 ] && vfs_done=1
-    fi
-  fi
-
-  # 2. extra disk (scratch). Try mounting first (a formatted disk mounts
-  #    without re-formatting); only mkfs when the mount fails AND no
-  #    .fsdone marker exists.
-  if [ "$extra_done" -eq 0 ]; then
-    if [ ! -b /dev/vdc ]; then
-      extra_done=1
-    elif grep -q " /mnt/extra " /proc/mounts 2>/dev/null; then
-      extra_done=1
-    else
-      mkdir -p /mnt/extra
-      if mount /dev/vdc /mnt/extra 2>/dev/null; then
-        extra_done=1
-      elif [ ! -f /mnt/extra/.fsdone ]; then
-        mkfs.xfs /dev/vdc 2>&1 | tail -1
-        if mount /dev/vdc /mnt/extra 2>/dev/null; then
-          touch /mnt/extra/.fsdone
-          extra_done=1
-        fi
-      fi
     fi
   fi
 
@@ -734,7 +710,7 @@ for i in $(seq 1 60); do
   fi
 
   # converged? exit early (a healthy VM breaks at ~iteration 1-2).
-  if [ "$vfs_done" -eq 1 ] && [ "$extra_done" -eq 1 ] && [ "$iso_done" -eq 1 ] && [ "$net_done" -eq 1 ] && [ "$ssh_done" -eq 1 ] && [ "$grow_done" -eq 1 ]; then
+  if [ "$vfs_done" -eq 1 ] && [ "$iso_done" -eq 1 ] && [ "$net_done" -eq 1 ] && [ "$ssh_done" -eq 1 ] && [ "$grow_done" -eq 1 ]; then
     break
   fi
   sleep 1

@@ -75,7 +75,7 @@ pub fn delete_vm(home: &VmHome, meta: &crate::state::VmMeta, force: bool) -> i32
         // Reconcile: a "running" record whose supervisor pid is dead
         // (host reboot, kill -9 of the supervisor) is just a record of
         // the last session — rewrite meta.json to stopped and delete.
-        let alive = raw.ch_pid.map(crate::state::pid_alive).unwrap_or(false);
+        let alive = raw.ch_pid.map(crate::state::ch_pid_alive).unwrap_or(false);
         if !alive {
             let mut fixed = raw.clone();
             fixed.state = VmState::Stopped;
@@ -95,7 +95,11 @@ pub fn delete_vm(home: &VmHome, meta: &crate::state::VmMeta, force: bool) -> i32
             );
             return 5;
         } else {
-            if let Some(pid) = raw.ch_pid {
+            if let Some(pid) = raw.ch_pid
+                // Re-verify at kill time (a window between the alive check
+                // above and this kill could see the pid die + be reused).
+                && crate::state::ch_pid_alive(pid)
+            {
                 let _ = std::process::Command::new("kill").arg(pid.to_string()).output();
             }
             // also kill any CH supervising this disk (belt and braces)
@@ -172,7 +176,6 @@ mod tests {
             vcpus: 1,
             memory_mb: 1024,
             disk_gb: 80,
-            extra_disk: false,
             kvm: false,
             squash_uid: 1000,
             base_image_sha256: None,
@@ -277,16 +280,40 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Poll until a spawned child's /proc/<pid>/cmdline is populated
+    /// (spawn() returns mid fork/exec — ch_pid_alive reads it, and an
+    /// empty cmdline is not trusted).
+    fn wait_cmdline(pid: i32) {
+        for _ in 0..100 {
+            if std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|c| !c.is_empty())
+                .unwrap_or(false)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn rm_refuses_genuinely_running_without_force() {
         let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
         let home = VmHome { root: dir.clone() };
         let a = new_id();
-        // A genuinely running VM: the recorded pid is alive (our own test
-        // process) — rm must still refuse without --force.
-        make_vm(&home, &a, None, VmState::Running, Some(std::process::id() as i32));
+        // A genuinely running VM: the recorded pid is a live cloud-hypervisor
+        // stand-in (argv[0] = cloud-hypervisor), so ch_pid_alive trusts it
+        // and rm must refuse without --force.
+        let mut fake_ch = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec -a cloud-hypervisor sleep 30")
+            .spawn()
+            .unwrap();
+        wait_cmdline(fake_ch.id() as i32);
+        make_vm(&home, &a, None, VmState::Running, Some(fake_ch.id() as i32));
         assert_eq!(rm(vec![a.clone()]).run(&home), 5);
         assert!(home.vms_dir().join(&a).exists());
+        let _ = fake_ch.kill();
+        let _ = fake_ch.wait();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -295,9 +322,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
         let home = VmHome { root: dir.clone() };
         let a = new_id();
-        // A live stand-in for the supervisor (NOT our own pid — --force
-        // kills it).
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        // A live stand-in for CH (argv[0] = cloud-hypervisor, so
+        // ch_pid_alive trusts it) — --force must go through the real
+        // force-kill branch (kill pid + pgrep + lock poll), not the
+        // stale-reconcile path.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec -a cloud-hypervisor sleep 30")
+            .spawn()
+            .unwrap();
+        wait_cmdline(child.id() as i32);
         make_vm(&home, &a, None, VmState::Running, Some(child.id() as i32));
         assert_eq!(Rm { targets: vec![a.clone()], force: true }.run(&home), 0);
         assert!(!home.vms_dir().join(&a).exists());

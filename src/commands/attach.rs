@@ -60,16 +60,7 @@ impl Attach {
 
         let key = meta.ssh_key_path(home);
         let mut ssh = std::process::Command::new("ssh");
-        ssh.arg("-i")
-            .arg(key.to_string_lossy().into_owned())
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
+        ssh.args(crate::vm::ssh_opts(&key))
             .arg("-t") // interactive shell needs a pty
             .arg(format!("root@{}", meta.ip))
             .arg("cd /workspace; bash");
@@ -128,7 +119,6 @@ mod tests {
             vcpus: 1,
             memory_mb: 1024,
             disk_gb: 80,
-            extra_disk: false,
             kvm: false,
             squash_uid: 1000,
             state,

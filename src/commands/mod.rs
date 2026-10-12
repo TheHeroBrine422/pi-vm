@@ -3,9 +3,7 @@
 
 pub mod attach;
 pub mod create;
-pub mod doctor;
 pub mod fetch;
-pub mod inspect;
 pub mod install;
 pub mod list;
 pub mod logs;
@@ -23,13 +21,9 @@ use crate::state::VmHome;
 pub enum Cmd {
     /// Show CLI + asset versions and image hashes
     Version,
-    /// Diagnose the host (KVM, packages, assets, images)
-    Doctor(doctor::Doctor),
     /// List VMs (docker ps -a style; alias: ls)
     #[command(alias = "ls")]
     List(list::List),
-    /// Show full metadata for one VM
-    Inspect(inspect::Inspect),
     /// Delete one or more VMs (disk + state + network). --force kills a running instance first.
     Rm(rm::Rm),
     /// Create a new VM from the pre-baked base and attach an ssh session
@@ -54,9 +48,7 @@ impl Cmd {
     pub fn run(self, home: &VmHome) -> i32 {
         match self {
             Cmd::Version => version::run(home),
-            Cmd::Doctor(args) => args.run(home),
             Cmd::List(args) => args.run(home),
-            Cmd::Inspect(args) => args.run(home),
             Cmd::Rm(args) => args.run(home),
             Cmd::Create(args) => args.run(home),
             Cmd::Resume(args) => args.run(home),

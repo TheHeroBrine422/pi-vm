@@ -11,28 +11,16 @@
 
 use clap::Args;
 
-use crate::commands::doctor::Doctor;
 use crate::state::VmHome;
 use crate::util::{run, run_ok, virtiofsd_path};
 
 const CH_VERSION: &str = "v53.0";
 
 #[derive(Args)]
-pub struct Install {
-    /// Only check, don't install
-    #[arg(long)]
-    pub check: bool,
-}
+pub struct Install {}
 
 impl Install {
     pub fn run(&self, home: &VmHome) -> i32 {
-        if self.check {
-            println!("==> check mode: reporting what is present/missing (no installs)");
-            let rc = Doctor { detailed: true }.run(home);
-            self.check_assets(home);
-            return rc;
-        }
-
         if !run_ok("which", &["dnf"]) && !run_ok("which", &["apt-get"]) {
             eprintln!("error: no supported package manager (dnf or apt-get) found");
             return 2;
@@ -292,20 +280,6 @@ impl Install {
             let _ = std::fs::remove_file(format!("{}.part", img.display()));
             let _ = std::fs::remove_file(format!("{}.cksum", img.display()));
             eprintln!("   ERROR: cloud image not available — re-run `pi-vm install`");
-        }
-    }
-
-    fn check_assets(&self, home: &VmHome) {
-        println!();
-        println!("asset status:");
-        for (label, p) in [
-            ("cloud-hypervisor", home.ch_binary()),
-            ("kernel (direct boot)", home.kernel()),
-            ("initramfs (direct boot)", home.initramfs()),
-            ("fedora44-cloud.qcow2", home.cloud_image()),
-            ("fedora44-cloud-prepped.qcow2", home.prepped_image()),
-        ] {
-            println!("  {label:<28} {}", if p.exists() { "present" } else { "MISSING" });
         }
     }
 }

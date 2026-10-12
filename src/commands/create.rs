@@ -23,18 +23,12 @@ pub struct Create {
     pub memory: u32,
     #[arg(long, default_value_t = 80)]
     pub disk: u32,
-    /// Extra scratch disk in GB (mounted at /mnt/extra)
-    #[arg(long, default_value_t = 0)]
-    pub extra_disk: u32,
     /// KVM on|off (CH requires KVM; off = no nested)
     #[arg(long, default_value = "on")]
     pub kvm: String,
     /// Squash all guest uids to this host uid (default: owner of the project dir)
     #[arg(long)]
     pub squash_uid: Option<u32>,
-    /// Show the VM console live while waiting for boot (instead of a spinner)
-    #[arg(long)]
-    pub console: bool,
     /// Attach to a plain shell in /workspace instead of starting the agent
     #[arg(long)]
     pub shell: bool,
@@ -51,8 +45,9 @@ pub struct Create {
     pub timeout: Option<u64>,
     /// Delete the VM (disk + state + network) when it stops normally
     /// (the attach session ends, or --timeout fires) instead of leaving
-    /// it stopped. A failed boot or a failed attach session does NOT
-    /// delete it (investigate with `pi-vm logs` / `pi-vm resume`).
+    /// it stopped. A failed boot, a failed attach session, or an
+    /// interrupted (Ctrl-C/SIGTERM) non-interactive run does NOT delete
+    /// it (investigate with `pi-vm logs` / `pi-vm resume`).
     #[arg(long)]
     pub rm: bool,
 }
@@ -66,6 +61,17 @@ impl Create {
             }
             (Some(p), false) => Some(p.clone()),
             _ => None,
+        };
+        // Validate --kvm BEFORE writing prompt.txt below: an early return
+        // here must not leave our copy behind (the rollback in the
+        // create_vm error branch does not cover these paths).
+        let kvm = match self.kvm.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => {
+                eprintln!("error: --kvm must be 'on' or 'off'");
+                return 2;
+            }
         };
         // Agent mode: the prompt must end up in the shared folder (the
         // guest reads /workspace/prompt.txt — no ISO delivery involved).
@@ -105,21 +111,12 @@ impl Create {
                 .map(|p| std::path::Path::new(p).join("prompt.txt").exists())
                 .unwrap_or(false),
         };
-        let kvm = match self.kvm.as_str() {
-            "on" => true,
-            "off" => false,
-            _ => {
-                eprintln!("error: --kvm must be 'on' or 'off'");
-                return 2;
-            }
-        };
         let cfg = VmConfig {
             project,
             name: self.name.clone(),
             vcpus: self.vcpus,
             memory_mb: self.memory,
             disk_gb: self.disk,
-            extra_disk: self.extra_disk,
             kvm,
             squash_uid: self.squash_uid,
         };
@@ -141,20 +138,25 @@ impl Create {
             }
         };
         let rm_meta = meta.clone(); // for the --rm auto-delete after boot
-        match boot(home, meta, attach, self.console, self.shell, agent_mode, self.timeout, self.rm) {
+        match boot(home, meta, attach, self.shell, agent_mode, self.timeout, self.rm) {
             Ok(code) => {
                 if self.rm {
-                    // Only a normal stop reaches here (attach session ended,
-                    // or --timeout fired): a failed boot AND a failed attach
-                    // session return Err from boot, so the VM is not
-                    // deleted. Delete via the rm logic (lock is free — boot
-                    // released it). force=true: the teardown already killed
-                    // the children; the running-check is belt-and-braces.
+                    // Only a normal stop reaches here (attach session
+                    // ended, --timeout fired, SIGTERM to an attached run,
+                    // or the guest powered itself off): a failed boot,
+                    // a failed attach session, and an interrupted
+                    // non-interactive run all return Err from boot, so
+                    // the VM is not deleted. force=FALSE on purpose: a
+                    // "running" record with a LIVE pid here means
+                    // someone resumed the VM in the stop→delete window —
+                    // its CH must not be killed (a stale record's dead
+                    // pid is reconciled by delete_vm, no force needed).
                     let name = rm_meta.name.as_deref().unwrap_or(&rm_meta.id);
                     println!("==> --rm: deleting VM {name} (disk + state + network)");
-                    if crate::commands::rm::delete_vm(home, &rm_meta, true) != 0 {
-                        eprintln!("error: --rm auto-delete failed — VM {} still exists; delete it with `pi-vm rm {}`", rm_meta.id, rm_meta.id);
-                        return 1;
+                    let rc = crate::commands::rm::delete_vm(home, &rm_meta, false);
+                    if rc != 0 {
+                        eprintln!("error: --rm auto-delete failed (code {rc}) — the VM may still exist; check `pi-vm ls`");
+                        return rc;
                     }
                 }
                 code

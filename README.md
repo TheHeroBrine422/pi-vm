@@ -35,7 +35,7 @@ name creates a VM (e.g. `pi-vm /tmp/proj`). A path that collides with a
 subcommand name (e.g. a dir named `list`) must be given as `./list`.
 
 ```
-pi-vm install [--check]   one-time host setup: packages, CH +
+pi-vm install           one-time host setup: packages, CH +
                          cloud image (sha256-verified), nested KVM;
                          prints a hint to run `pi-vm bake`
 pi-vm bake [--pi-dir D] [--timeout N]
@@ -44,8 +44,8 @@ pi-vm bake [--pi-dir D] [--timeout N]
                          the VM equivalent of a container image's
                          build-time COPY
 pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
-              [--extra-disk N] [--kvm on|off] [--squash-uid U] [--no-mount]
-              [--console] [--shell] [--prompt-file F] [--timeout N] [--rm]
+              [--kvm on|off] [--squash-uid U] [--no-mount]
+              [--shell] [--prompt-file F] [--timeout N] [--rm]
                          new VM from the pre-baked base (no path, or
                          --no-mount, = no shared mount: no virtiofsd, no
                          /workspace in the guest); boots and (if the
@@ -65,7 +65,7 @@ pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
                          (disk + state + network) instead of leaving it
                          stopped; a failed boot or a failed attach does
                          not delete it
-pi-vm resume <id|name> [--console] [--shell] [--prompt-file F]
+pi-vm resume <id|name> [--shell] [--prompt-file F]
            [--timeout N] [--rm]
                          boot an existing VM and attach; --prompt-file
                          re-copies the prompt (the disk persists, so a
@@ -96,7 +96,6 @@ pi-vm list [-v] [--filter KEY=VALUE]... [--sort created|last-run|state|name|id]
                          --sort: order the rows (state: running first;
                          nameless first by name); --reverse flips the
                          order; no --sort keeps the default order
-pi-vm inspect <id|name> full metadata (meta.json + paths)
 pi-vm logs <id|name> [-f] [-n N]
                          VM console log (follow with -f)
 pi-vm rm <id|name>... [--force]
@@ -107,8 +106,6 @@ pi-vm rm <id|name>... [--force]
                          reboot or kill -9 of the supervisor) is
                          reconciled to stopped automatically — only a
                          genuinely running VM needs --force
-pi-vm doctor [--detailed]
-                         host diagnostics: KVM, packages, assets, images
 pi-vm version           CLI + CH versions, image hashes
 ```
 
@@ -177,7 +174,7 @@ pi-vm version           CLI + CH versions, image hashes
   gpg program), with a default user.name/email. Re-run `pi-vm bake` after
   changing the pi config.
   Each new VM records the base image's sha256 in meta.json (shown by
-  `pi-vm inspect`), so you can tell whether it is based on the most
+  `pi-vm ls -v`), so you can tell whether it is based on the most
   recent bake (compare against `pi-vm version`).
 - **Direct kernel boot** — no UEFI, no GRUB: CH loads the kernel +
   initramfs straight from the baked assets (~5–8 s faster than a firmware
@@ -204,7 +201,8 @@ pi-vm version           CLI + CH versions, image hashes
   interrupts (exit 130) and tears the VM down the same graceful way. The
   disk is left intact for `pi-vm resume`. `kill <pi-vm-pid>` (SIGTERM)
   works in every state — while attached it stops the ssh session and tears
-  the VM down the same graceful way. `kill -9` no longer orphans the VM
+  the VM down the same graceful way; a SIGTERM stop of an attached --rm
+  VM counts as a normal stop (the VM is deleted). `kill -9` no longer orphans the VM
   either: every child carries PR_SET_PDEATHSIG, so a dead supervisor
   SIGTERMs CH (immediate host-side poweroff) + virtiofsd + the ssh client.
 - **What does Ctrl-Z do?** It is caught and ignored (you get a one-line
@@ -289,12 +287,12 @@ truth for "in use".
 |---|---|
 | 0 | success |
 | 1 | generic error (incl. attach/send/fetch: VM not running) |
-| 2 | usage / preflight / not-found (rm/inspect/logs bad target; missing image, no KVM, name collision, network; resume bad target) |
+| 2 | usage / preflight / not-found (rm/logs bad target; missing image, no KVM, name collision, network; resume bad target) |
 | 3 | VM failed to boot (CH exited during boot) / bake verification failed |
 | 4 | ssh did not become reachable within the timeout |
 | 5 | VM is in use by another pi-vm process |
 | 124 | bake prep boot timed out |
-| 130 | interrupted (Ctrl-C / SIGTERM) |
+| 130 | interrupted (Ctrl-C / SIGTERM) — the disk is intact for resume; --rm does not delete |
 
 Note: Ctrl-C while attached to the ssh session goes to the remote session
 (docker-attach semantics); the VM stops when the ssh session ends (for the

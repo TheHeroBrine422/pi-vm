@@ -49,18 +49,15 @@ impl Send {
         // single quotes backslashes are LITERAL, so only the quote
         // itself needs escaping.
         let q = escape_single_quoted(&msg);
-        let cmd = format!("tmux send-keys -t agent '{q}' Enter");
+        // -l: the message is typed LITERALLY (a message that is a tmux
+        // key name — 'Enter', 'Space', 'C-c' — must not be sent as the
+        // key); -l persists across args, so Enter goes in a second call.
+        let cmd = format!("tmux send-keys -t agent -l '{q}'; tmux send-keys -t agent Enter");
         let key = meta.ssh_key_path(home);
         let o = std::process::Command::new("ssh")
-            .args([
-                "-i", &key.to_string_lossy(),
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=10",
-                &format!("root@{}", meta.ip),
-                &cmd,
-            ])
+            .args(crate::vm::ssh_opts(&key))
+            .arg(format!("root@{}", meta.ip))
+            .arg(&cmd)
             .output();
         match o {
             Ok(o) if o.status.success() => {

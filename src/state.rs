@@ -132,7 +132,6 @@ pub struct VmMeta {
     pub vcpus: u32,
     pub memory_mb: u32,
     pub disk_gb: u32,
-    pub extra_disk: bool,
     pub kvm: bool,
     /// The uid all guest uids are squashed to (the ownership guarantee).
     pub squash_uid: u32,
@@ -205,7 +204,7 @@ impl VmMeta {
         let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let mut meta: VmMeta = serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
         if meta.state == VmState::Running {
-            let alive = meta.ch_pid.map(pid_alive).unwrap_or(false);
+            let alive = meta.ch_pid.map(ch_pid_alive).unwrap_or(false);
             if !alive {
                 meta.state = VmState::Stopped;
                 meta.ch_pid = None;
@@ -224,6 +223,20 @@ impl VmMeta {
 /// kill -9 of the supervisor) is just a record of the last session.
 pub fn pid_alive(pid: i32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// True if the pid is alive AND is a cloud-hypervisor process. The
+/// recorded ch_pid must be verified before it is trusted: after a host
+/// reboot the pid number is routinely REUSED by an unrelated process,
+/// and a bare /proc existence check would treat that as "the VM is
+/// running" — and `rm --force` would kill the innocent process.
+pub fn ch_pid_alive(pid: i32) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|c| String::from_utf8_lossy(&c).contains("cloud-hypervisor"))
+        .unwrap_or(false)
 }
 
 /// Generate a 12-hex unique id (docker-style).
@@ -429,7 +442,6 @@ mod tests {
             vcpus: 4,
             memory_mb: 8192,
             disk_gb: 80,
-            extra_disk: false,
             kvm: true,
             squash_uid: 1000,
             base_image_sha256: None,
@@ -458,7 +470,6 @@ mod tests {
             vcpus: 2,
             memory_mb: 4096,
             disk_gb: 80,
-            extra_disk: true,
             kvm: false,
             squash_uid: 1000,
             base_image_sha256: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
@@ -493,7 +504,6 @@ mod tests {
             vcpus: 1,
             memory_mb: 1024,
             disk_gb: 80,
-            extra_disk: false,
             kvm: true,
             squash_uid: 1000,
             base_image_sha256: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
@@ -530,7 +540,6 @@ mod tests {
             vcpus: 1,
             memory_mb: 1024,
             disk_gb: 80,
-            extra_disk: false,
             kvm: true,
             squash_uid: 1000,
             base_image_sha256: None,
@@ -568,7 +577,6 @@ mod tests {
             vcpus: 1,
             memory_mb: 1024,
             disk_gb: 80,
-            extra_disk: false,
             kvm: true,
             squash_uid: 1000,
             base_image_sha256: None,
@@ -596,7 +604,6 @@ mod tests {
             vcpus: 1,
             memory_mb: 1024,
             disk_gb: 80,
-            extra_disk: false,
             kvm: false,
             squash_uid: 1000,
             state,
@@ -619,6 +626,44 @@ mod tests {
     fn pid_alive_detects_live_and_dead() {
         assert!(pid_alive(std::process::id() as i32));
         assert!(!pid_alive(dead_pid()));
+    }
+
+    /// Poll until a spawned child's /proc/<pid>/cmdline is populated
+    /// (spawn() returns mid fork/exec — reading it too early sees an
+    /// empty cmdline, which ch_pid_alive correctly does not trust).
+    fn wait_cmdline(pid: i32) {
+        for _ in 0..100 {
+            if std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|c| !c.is_empty())
+                .unwrap_or(false)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The recorded ch_pid must be verified as an actual cloud-hypervisor
+    /// process before it is trusted: a bare /proc existence check would
+    /// treat a REUSED pid (routinely re-allocated after a host reboot) as
+    /// "the VM is running", and `rm --force` would kill the innocent
+    /// process that got it.
+    #[test]
+    fn ch_pid_alive_verifies_the_process_is_ch() {
+        let mut fake_ch = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec -a cloud-hypervisor sleep 30")
+            .spawn()
+            .unwrap();
+        wait_cmdline(fake_ch.id() as i32);
+        assert!(ch_pid_alive(fake_ch.id() as i32));
+        let _ = fake_ch.kill();
+        let _ = fake_ch.wait();
+        assert!(!ch_pid_alive(fake_ch.id() as i32)); // reaped -> gone
+        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(!ch_pid_alive(other.id() as i32)); // alive, but not CH
+        let _ = other.kill();
+        let _ = other.wait();
     }
 
     #[test]
@@ -645,17 +690,27 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
         let home = VmHome { root: dir.clone() };
         let id = new_id();
-        let self_pid = std::process::id() as i32;
-        test_meta(&id, VmState::Running, Some(self_pid)).save(&home).unwrap();
+        // A live stand-in for CH (argv[0] = cloud-hypervisor, so
+        // ch_pid_alive's cmdline check recognizes it as a real VM).
+        let mut fake_ch = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec -a cloud-hypervisor sleep 30")
+            .spawn()
+            .unwrap();
+        wait_cmdline(fake_ch.id() as i32);
+        let ch_pid = fake_ch.id() as i32;
+        test_meta(&id, VmState::Running, Some(ch_pid)).save(&home).unwrap();
         let loaded = VmMeta::load(&home, &id).unwrap();
         assert_eq!(loaded.state, VmState::Running);
-        assert_eq!(loaded.ch_pid, Some(self_pid));
+        assert_eq!(loaded.ch_pid, Some(ch_pid));
         // The file must be left untouched.
         let raw: VmMeta = serde_json::from_str(
             &std::fs::read_to_string(home.vms_dir().join(&id).join("meta.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(raw.state, VmState::Running);
+        let _ = fake_ch.kill();
+        let _ = fake_ch.wait();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

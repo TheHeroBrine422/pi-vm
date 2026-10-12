@@ -136,7 +136,7 @@ impl List {
     pub fn run(&self, home: &VmHome) -> i32 {
         let ids = home.list_vm_ids();
         if ids.is_empty() {
-            println!("no VMs (run `pi-vm create <path>` or `pi-vm create --no-mount` first — see `pi-vm doctor`)");
+            println!("no VMs (run `pi-vm create <path>` or `pi-vm create --no-mount` first)");
             return 0;
         }
         let metas: Vec<VmMeta> = ids
@@ -177,8 +177,12 @@ impl List {
                 println!("  project:  {}", meta.project.as_deref().unwrap_or("(no mount)"));
                 println!("  network:  {} / {} / {}", meta.subnet, meta.ip, meta.mac);
                 println!(
-                    "  resources: {} vcpus, {} MB, {} GB disk, extra_disk={}, kvm={}, squash_uid={}",
-                    meta.vcpus, meta.memory_mb, meta.disk_gb, meta.extra_disk, meta.kvm, meta.squash_uid
+                    "  resources: {} vcpus, {} MB, {} GB disk, kvm={}, squash_uid={}",
+                    meta.vcpus, meta.memory_mb, meta.disk_gb, meta.kvm, meta.squash_uid
+                );
+                println!(
+                    "  base img: {}",
+                    meta.base_image_sha256.clone().unwrap_or_else(|| "(unknown)".into())
                 );
                 println!("  created:  {}", fmt_ts(meta.created));
                 println!("  last run: {}", fmt_ts(meta.updated));
@@ -277,7 +281,6 @@ mod tests {
             vcpus: 1,
             memory_mb: 1024,
             disk_gb: 80,
-            extra_disk: false,
             kvm: true,
             squash_uid: 1000,
             state,

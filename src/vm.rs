@@ -39,6 +39,8 @@ pub enum BootFail {
     SshUnreachable(String), // 4
     /// VM is in use by another pi-vm process
     InUse(String), // 5
+    /// Interrupted (Ctrl-C / SIGTERM) before a normal stop
+    Interrupted(String), // 130
     /// Other
     Other(String), // 1
 }
@@ -50,6 +52,7 @@ impl BootFail {
             BootFail::BootFailed(_) => 3,
             BootFail::SshUnreachable(_) => 4,
             BootFail::InUse(_) => 5,
+            BootFail::Interrupted(_) => 130,
             BootFail::Other(_) => 1,
         }
     }
@@ -59,6 +62,7 @@ impl BootFail {
             | BootFail::BootFailed(s)
             | BootFail::SshUnreachable(s)
             | BootFail::InUse(s)
+            | BootFail::Interrupted(s)
             | BootFail::Other(s) => s,
         }
     }
@@ -72,7 +76,6 @@ pub struct VmConfig {
     pub vcpus: u32,
     pub memory_mb: u32,
     pub disk_gb: u32,
-    pub extra_disk: u32,
     pub kvm: bool,
     /// Default: owner uid of the project dir (the ownership guarantee).
     pub squash_uid: Option<u32>,
@@ -141,7 +144,6 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
         vcpus: cfg.vcpus,
         memory_mb: cfg.memory_mb,
         disk_gb: cfg.disk_gb,
-        extra_disk: cfg.extra_disk > 0,
         kvm: cfg.kvm,
         squash_uid: squash,
         base_image_sha256,
@@ -163,13 +165,6 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     let disk = meta.disk_path(home);
     run("cp", &[prepped.to_str().unwrap(), disk.to_str().unwrap()])?;
     run("qemu-img", &["resize", &disk.to_string_lossy(), &format!("{}G", meta.disk_gb)])?;
-    if cfg.extra_disk > 0 {
-        run("qemu-img", &[
-            "create", "-f", "qcow2",
-            &dir.join("extra.qcow2").to_string_lossy(),
-            &format!("{}G", cfg.extra_disk),
-        ])?;
-    }
 
     println!("   created VM {} {} ({} vcpus, {} MB, {} GB disk)",
         meta.id, meta.name.as_deref().unwrap_or("(no name)"), meta.vcpus, meta.memory_mb, meta.disk_gb);
@@ -297,7 +292,7 @@ fn attach_title_prefix(meta: &VmMeta) -> Option<String> {
 /// with a boot buffer). `rm`: the caller will auto-delete the VM after a
 /// normal stop (the --rm flag — only affects the stop message; the
 /// deletion itself happens in the caller, after the lock is released).
-pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: bool,
+pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
            agent_mode: bool, timeout_s: Option<u64>, rm: bool) -> Result<i32, BootFail> {
     let boot_start = std::time::Instant::now();
     let deadline = timeout_s
@@ -525,10 +520,6 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
         "--console".into(),
         format!("file={}", meta.console_path(home).display()),
     ]);
-    if meta.extra_disk {
-        ch_args.push("--disk".into());
-        ch_args.push(format!("path={},image_type=qcow2", meta.vm_dir(home).join("extra.qcow2").display()));
-    }
     if meta.project.is_some() {
         ch_args.push("--fs".into());
         ch_args.push(format!(
@@ -592,7 +583,6 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     let boot_deadline = 300;
     let mut waited = 0;
     let mut ready = false;
-    let mut console_pos: u64 = 0;
     while waited < boot_deadline {
         thread::sleep(Duration::from_secs(2));
         waited += 2;
@@ -606,35 +596,18 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
             return Err(BootFail::BootFailed("CH exited during boot — see console.log".into()));
         }
-        if console {
-            // live-tail the console file (display only — the ssh probe below
-            // still runs)
-            if let Ok(data) = std::fs::read(meta.console_path(home))
-                && data.len() as u64 > console_pos {
-                    let start = (console_pos as usize).min(data.len());
-                    print!("{}", String::from_utf8_lossy(&data[start..]));
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    console_pos = data.len() as u64;
-                }
-        }
         if tcp_open(&meta.ip, 22) {
             let probe = Command::new("ssh")
-                .args([
-                    "-i", &key.to_string_lossy(),
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "UserKnownHostsFile=/dev/null",
-                    "-o", "BatchMode=yes",
-                    "-o", "ConnectTimeout=5",
-                    &format!("root@{}", meta.ip),
-                    "true",
-                ])
+                .args(ssh_opts(&key))
+                .arg(format!("root@{}", meta.ip))
+                .arg("true")
                 .output();
             if probe.map(|o| o.status.success()).unwrap_or(false) {
                 ready = true;
                 break;
             }
         }
-        if waited % 20 == 0 && !console {
+        if waited % 20 == 0 {
             print!("   booting… ({waited}s)");
             std::io::Write::flush(&mut std::io::stdout()).ok();
         }
@@ -643,10 +616,11 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     if !ready {
         if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
             eprintln!("interrupted — tearing down");
-        } else {
-            eprintln!("VM did not become ssh-reachable in {boot_deadline}s — console tail:");
-            tail_file(&meta.console_path(home), 20);
+            teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
+            return Err(BootFail::Interrupted("interrupted before ssh became reachable".into()));
         }
+        eprintln!("VM did not become ssh-reachable in {boot_deadline}s — console tail:");
+        tail_file(&meta.console_path(home), 20);
         teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
         return Err(BootFail::SshUnreachable("boot timed out".into()));
     }
@@ -665,20 +639,13 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
     // it. ssh-ready implies the /workspace mount is up (the baked
     // pi-vm-net unit runs Before=sshd and mounts it first).
     if agent_mode && !shell {
-        let key_s = key.to_string_lossy().into_owned();
         let start_cmd = "tmux has-session -t agent 2>/dev/null || tmux new-session -d -s agent -f /dev/null \"tmux set status off; PI_VM_SERVICE=1 /usr/local/bin/pi-vm-launch.sh\"";
         let mut started = false;
         for _ in 0..3 {
             let o = Command::new("ssh")
-                .args([
-                    "-i", &key_s,
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "UserKnownHostsFile=/dev/null",
-                    "-o", "BatchMode=yes",
-                    "-o", "ConnectTimeout=10",
-                    &format!("root@{}", meta.ip),
-                    start_cmd,
-                ])
+                .args(ssh_opts(&key))
+                .arg(format!("root@{}", meta.ip))
+                .arg(start_cmd)
                 .output();
             if o.map(|o| o.status.success()).unwrap_or(false) {
                 started = true;
@@ -695,24 +662,24 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
 
     // --- attach or foreground-wait ---
     // `attach_failed`: the attach ssh session did not run normally (spawn
-    // failed, or ssh exited on its own with an error — a transient
-    // connection/auth hiccup). A normal stop (user exit, or the timeout /
-    // SIGTERM kill of the session — `stop_announced`) is NOT a failure.
-    // A failed attach must surface as Err (exit 1, same as before): the
-    // --rm auto-delete skips Err, so an Ok(1) here would delete the VM
-    // after a transient ssh hiccup.
+    // failed, wait failed, or ssh exited with 255 — a transport/auth
+    // failure — while the guest was still up). Normal stops — user exit
+    // (any remote status, docker-like), the timeout/SIGTERM kill of the
+    // session (`stop_announced`), and a guest-initiated poweroff
+    // (`guest_stopped`) — are NOT failures and report Ok. A failed attach
+    // must surface as Err (exit 1, same as before): the --rm auto-delete
+    // skips Err, so an Ok(1) here would delete the VM after a transient
+    // ssh hiccup.
     let mut attach_failed = false;
+    // A non-interactive run stopped by Ctrl-C/SIGTERM is NOT a normal stop
+    // (README: exit 130, the disk is left intact for `pi-vm resume`, and
+    // --rm does not delete it).
+    let mut interrupted_stop = false;
     let code = if attach {
         println!("==> attached — exiting the ssh session stops the VM (Ctrl-C goes to the remote session; SIGTERM stops the VM)");
-        let key_s = key.to_string_lossy().into_owned();
         let target = format!("root@{}", meta.ip);
         let mut ssh = Command::new("ssh");
-        ssh.arg("-i")
-            .arg(&key_s)
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
+        ssh.args(ssh_opts(&key))
             .arg("-t")
             .arg(&target);
         // Drop into /workspace (baked into the image, so `cd` always works —
@@ -757,7 +724,8 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
                 1
             }
             Ok(mut ssh) => {
-                let mut stop_announced = false;
+                let mut stop_announced = false; // we killed ssh (timeout / SIGTERM)
+                let mut guest_stopped = false; // CH exited on its own (guest poweroff)
                 loop {
                     if tstp.swap(false, Ordering::Relaxed) {
                         eprintln!("{SIGTSTP_HINT}");
@@ -775,15 +743,69 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
                         }
                         libc_kill(ssh.id(), 15);
                     }
+                    // Guest-initiated stop (an agent VM finishing, or the
+                    // user ran `poweroff` in the guest): sshd dies a few
+                    // seconds BEFORE CH exits, and a live ssh client then
+                    // hangs on the dead connection for the full TCP
+                    // retransmit timeout (~15 min). Kill it as soon as CH
+                    // is gone and treat it as a normal stop.
+                    if ch_child.try_wait().ok().flatten().is_some() {
+                        if let Ok(None) = ssh.try_wait() {
+                            libc_kill(ssh.id(), 15);
+                        }
+                        guest_stopped = true;
+                    }
                     match ssh.try_wait() {
                         Ok(Some(s)) => {
                             let c = s.code().unwrap_or(0);
-                            if c != 0 && !stop_announced {
-                                // ssh died on its own (not our timeout/SIGTERM
-                                // kill) — a transient failure, not a normal stop.
+                            if c == 255 && !stop_announced && !guest_stopped {
+                                // 255 = an ssh TRANSPORT failure (connection /
+                                // auth — a remote session ending with status
+                                // 1-254 is a normal end, docker-like).
+                                //
+                                // Two very different causes: (A) the guest
+                                // is powering off — sshd stops MID-shutdown,
+                                // but CH exits only at the end (a full guest
+                                // shutdown takes 45-120 s); (B) a transient
+                                // ssh hiccup while the guest is still up.
+                                // A 255 cannot distinguish them, so give the
+                                // guest the full stop budget: CH exiting in
+                                // the window means (A) — a normal stop;
+                                // otherwise it was (B) — report the failure
+                                // (the VM is left intact for `pi-vm resume`).
+                                let t0 = std::time::Instant::now();
+                                let deadline = t0 + Duration::from_secs(120);
+                                let mut hint_printed = false;
+                                loop {
+                                    if ch_child.try_wait().ok().flatten().is_some() {
+                                        guest_stopped = true;
+                                        break;
+                                    }
+                                    if std::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    if !hint_printed
+                                        && t0.elapsed() >= Duration::from_secs(15)
+                                    {
+                                        eprintln!("guest still up — waiting for the shutdown to finish (a transient ssh failure will be reported when the window closes)");
+                                        hint_printed = true;
+                                    }
+                                    thread::sleep(Duration::from_millis(500));
+                                }
+                            }
+                            if c == 255 && !stop_announced && !guest_stopped {
+                                // ssh died on its own while the guest is
+                                // still up — a transient connection/auth
+                                // failure, not a normal stop.
+                                eprintln!("ssh session ended with a transport error (255) while the VM is still up — treating as an attach failure");
                                 attach_failed = true;
                             }
-                            break c;
+                            // A stop we caused (timeout / SIGTERM) or a
+                            // guest-initiated poweroff is a NORMAL stop:
+                            // report 0 (a planned stop is not an error —
+                            // and --rm deletes on Ok). A remote session
+                            // status (1-254) propagates, docker-like.
+                            break if stop_announced || guest_stopped { 0 } else { c };
                         }
                         Ok(None) => thread::sleep(Duration::from_millis(200)),
                         Err(e) => {
@@ -802,6 +824,8 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
         loop {
             thread::sleep(Duration::from_secs(1));
             if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
+                eprintln!("interrupted — stopping the VM");
+                interrupted_stop = true;
                 break;
             }
             if tstp.swap(false, Ordering::Relaxed) {
@@ -826,6 +850,11 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, console: bool, shell: boo
             "ssh attach failed — the VM is stopped; reconnect with `pi-vm resume {}`",
             meta.id
         )));
+    }
+    if interrupted_stop {
+        // Err so a --rm caller does not delete the interrupted run (the
+        // README promises the disk is left intact for `pi-vm resume`).
+        return Err(BootFail::Interrupted("interrupted (Ctrl-C / SIGTERM) — the VM was torn down".into()));
     }
     Ok(code)
 }
@@ -870,18 +899,10 @@ fn teardown(home: &VmHome, meta: &VmMeta, ch: &mut Child, vfs: &mut Option<Child
         // when the session's response stalls, and the wait below still
         // gives the guest time to finish shutting down.
         let _ = std::process::Command::new("timeout")
-            .args([
-                "30",
-                "ssh",
-                "-i",
-                key.to_str().unwrap_or("/dev/null"),
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=5",
-                &format!("root@{}", meta.ip),
-                "systemctl poweroff",
-            ])
+            .args(["30", "ssh"])
+            .args(ssh_opts(&key))
+            .arg(format!("root@{}", meta.ip))
+            .arg("systemctl poweroff")
             .output();
         // 2. Wait for the guest poweroff (CH exits on its own; the bake caps
         // the guest's systemd stop timeout at 30 s, so a healthy guest is
@@ -1000,6 +1021,29 @@ pub fn libc_kill(pid: u32, sig: i32) {
 }
 #[cfg(not(unix))]
 pub fn libc_kill(_pid: u32, _sig: i32) {}
+
+/// ssh options for talking to a VM's guest — the single source of truth
+/// for every ssh connection this tool makes (boot probe, agent-session
+/// start, attach, graceful poweroff, `pi-vm attach`, `pi-vm send`): the
+/// per-vm key, no host-key checking (the key and host are pi-vm's own),
+/// BatchMode (so an interactive prompt can never hang the supervisor),
+/// and a bounded connection. The caller appends `[-t] root@<ip> <remote
+/// command...>` — `-t` must come BEFORE the target (ssh treats everything
+/// after the target as the command).
+pub fn ssh_opts(key: &std::path::Path) -> Vec<String> {
+    vec![
+        "-i".into(),
+        key.to_string_lossy().into_owned(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+    ]
+}
 
 /// PUT /api/v1/vmm.shutdown over the CH unix-socket HTTP API (CH v53+).
 /// WARNING: this calls vm_delete() in CH — abrupt teardown, NOT a graceful
@@ -1170,22 +1214,6 @@ done",
         ));
         s.push('\n');
     }
-    if meta.extra_disk {
-        s.push_str(&runcmd_block(
-            "EXTRA=/dev/vdc;
-if [ -b $EXTRA ]; then
-  if [ ! -f /mnt/extra/.fsdone ]; then
-    mkdir -p /mnt/extra;
-    mkfs.xfs $EXTRA 2>&1 | tail -1;
-    mount $EXTRA /mnt/extra 2>/dev/null && touch /mnt/extra/.fsdone;
-  else
-    mkdir -p /mnt/extra;
-    mount $EXTRA /mnt/extra 2>/dev/null || true;
-  fi;
-fi",
-        ));
-        s.push('\n');
-    }
     s
 }
 
@@ -1211,7 +1239,6 @@ mod tests {
             vcpus: 4,
             memory_mb: 8192,
             disk_gb: 80,
-            extra_disk: true,
             kvm: true,
             squash_uid: 1000,
             base_image_sha256: None,
@@ -1243,8 +1270,8 @@ mod tests {
     #[test]
     fn user_data_runcmd_blocks_are_valid_yaml() {
         let s = user_data(&test_meta(), "ssh-ed25519 AAAA test");
-        // 5 base entries (net, ssh, grow, mount, extra)
-        assert_valid_yaml(&s, 5);
+        // 4 base entries (net, ssh, grow, mount)
+        assert_valid_yaml(&s, 4);
     }
 
     /// The clean-state check must not run the refcount rebuild on a
