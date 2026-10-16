@@ -17,15 +17,27 @@ docs/       forwarding.md (reaching private/remote services from a VM)
 ## Install / Setup
 
 Requirements:
-- a dnf-based (Fedora/CachyOS) or apt-based (Ubuntu/Debian) host —
-  `pi-vm install` detects the package manager and maps package names
+- a Linux host with KVM (`/dev/kvm`); a dnf-based (Fedora/CachyOS) or
+  apt-based (Ubuntu/Debian) distro is expected for the package list below
 - rust toolchain installed
+- host packages (install once, with your own package manager):
+  - dnf: `dnf install -y virtiofsd cloud-init genisoimage iproute qemu-img iptables libguestfs`
+  - apt: `apt-get install -y virtiofsd cloud-init genisoimage iproute2 qemu-utils iptables libguestfs-tools`
+  - (`libguestfs`/`libguestfs-tools` is only needed for `pi-vm bake`)
+- a Cloud Hypervisor binary — `pi-vm install` picks one up from `$CH_BIN`,
+  an existing assets copy, or `PATH` (e.g. a terrapkg install); otherwise
+  it downloads the static v53.0 build
 
 ```
 cargo install --path .
 pi-vm install
 pi-vm bake
 ```
+
+`pi-vm install` checks the requirements (printing the exact install command
+for anything missing — it does not run your package manager itself), sets
+up nested KVM, and fetches the assets (Cloud Hypervisor if not already
+present, and the sha256-verified Fedora 44 cloud image).
 
 ## Commands
 
@@ -35,7 +47,8 @@ name creates a VM (e.g. `pi-vm /tmp/proj`). A path that collides with a
 subcommand name (e.g. a dir named `list`) must be given as `./list`.
 
 ```
-pi-vm install           one-time host setup: packages, CH +
+pi-vm install           one-time host setup: check requirements (prints
+                         the install command for anything missing), CH +
                          cloud image (sha256-verified), nested KVM;
                          prints a hint to run `pi-vm bake`
 pi-vm bake [--pi-dir D] [--timeout N]
@@ -249,10 +262,34 @@ pi-vm version           CLI + CH versions, image hashes
 
 ## TODO
 
+- [ ] packaging: an RPM spec for pi-vm (Requires: the seven host packages;
+  in that world `pi-vm install` shrinks to: check requirements, CH from
+  PATH/$CH_BIN, nested KVM, cloud image) — then publish to terrapkg
+- [x] `install`: stop running the package manager — list the dnf/apt
+  packages in the README and just check + report what's missing
+- [x] `install`: find a `cloud-hypervisor` already on `PATH` (e.g. a
+  terrapkg install) before downloading the static binary ($CH_BIN >
+  existing assets copy > PATH > download)
+- [ ] extract the agent-VM machinery (`--prompt-file`, the `send`
+  subcommand, the tmux 'agent' session, the launch script, the agent
+  branches in `boot()`) into a separate project — likely a separate crate;
+  needs planning (the seam: a running VM + ssh + the baked pi; the agent
+  project would own the supervisor via `pi-vm resume --timeout` and the
+  agent interface, e.g. an RPC-over-TCP bridge instead of tmux keystrokes)
+- [ ] reuse between `bake.rs` and `vm.rs` if possible — the guest
+  net/ssh/mount setup is duplicated between the baked `pi-vm-net` unit
+  and the cloud-init `user_data` runcmd
+- [ ] performance: avoid generating the cloud-init NoCloud ISO at all —
+  pre-bake the ssh key + network setup (e.g. a small per-VM config file
+  or disk read by the baked units), set up the network and start CH in
+  parallel, and a slimmer kernel; needs exploration (the ISO currently
+  carries the per-VM ip/host/mac + pubkey + runcmd)
+
 - overlayfs to make the individual vhds smaller
 - gh cli/creds because api rate limits are a bitch, but also not letting it have write access to my accounts
-- Separate VM work trees via CoW
+- Separate VM work trees via CoW for a single project directory (tbh maybe unnecessary)
 - a better solution for syncing pi directory
+  - virtiofs share? would be cool for syncing sessions between VMs too
 - better ways to deal with long lasting commands. we likely need to see if pi can force commands to have a max timeout of lets say 10 minutes and never let the LLM do a timeout higher then that. maybe even 5 minutes tbh
 - maybe a shortcut for --no-mount for just asking quick questions
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually
@@ -262,6 +299,7 @@ pi-vm version           CLI + CH versions, image hashes
 - possibly keep older versions of the baked image and add a `pi-vm images` command?
 - codemode
 - maybe change this where you need to run it with sudo or similar to like the root access thing docker does since having sudo in the script is annoying cause if it times out you have to type in the password at the start and end of the session
+- /tmp getting full is a pain and it keeps randomly happening cause tmpfs is only 4gb by default
 - better tailscale aperture support. need to auto include the /etc/hosts file and figure out a better networking solution
 - Later goals (not required for v1):
   - Simplify subagents (fewer options for subagent types)
@@ -272,6 +310,20 @@ pi-vm version           CLI + CH versions, image hashes
     the project and place the output at ISSUES.md, then have another agent
     dedup the file and place it back in the original project path
   - A way to exclude files (credentials)
+
+
+
+Pi vm <path> being create or resume with it telling you if it will resume.
+
+Resume maybe does pi -r
+
+
+- possible performance improvements:
+  - prebake ssh key and things like networking so we hopefully dont need cloud init / nocloud at all
+  - do network setup and ch start in parallel
+  - slim kernel for faster CH boot
+  - sudo improvements to not pause part way through boot (mentioned earlier)
+  - fix the qcow refcount thing that might already be fixed
 
 ## Data layout
 

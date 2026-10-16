@@ -1,13 +1,15 @@
 //! `pi-vm install` — one-time host-side setup (port of vm/setup.sh).
 //!
-//!   1. installs host packages (virtiofsd, cloud-init, genisoimage, iproute,
-//!      qemu-img, iptables, libguestfs)
-//!   2. downloads the Cloud Hypervisor static binary (v53.0)
+//!   1. checks host requirements (virtiofsd, cloud-init, genisoimage,
+//!      iproute, qemu-img, iptables, libguestfs) and prints the exact
+//!      install command for anything missing — the user runs their own
+//!      package manager (per-distro lists are in the README)
+//!   2. locates the Cloud Hypervisor binary: $CH_BIN > existing assets
+//!      copy > PATH (e.g. a terrapkg install — symlinked into assets) >
+//!      download of the static v53.0 binary
 //!   3. enables nested KVM (so the VM can run its own VMs)
 //!   4. creates the data dirs + downloads the Fedora 44 cloud image
 //!      (sha256-verified)
-//!
-//! `--check` = dry run: report what is present/missing without installing.
 
 use clap::Args;
 
@@ -21,13 +23,12 @@ pub struct Install {}
 
 impl Install {
     pub fn run(&self, home: &VmHome) -> i32 {
-        if !run_ok("which", &["dnf"]) && !run_ok("which", &["apt-get"]) {
-            eprintln!("error: no supported package manager (dnf or apt-get) found");
-            return 2;
+        let pm = if run_ok("which", &["dnf"]) { Some("dnf") } else if run_ok("which", &["apt-get"]) { Some("apt") } else { None };
+        if !self.requirements(pm) {
+            eprintln!();
+            eprintln!("install incomplete: install the packages above, then re-run `pi-vm install`");
+            return 1;
         }
-
-        let pm = if run_ok("which", &["dnf"]) { "dnf" } else { "apt" };
-        self.packages(pm);
         self.ch_binary(home);
         self.nested_kvm();
         self.cloud_image(home);
@@ -38,105 +39,107 @@ impl Install {
         0
     }
 
-    /// Host packages. Detected per distro (dnf: Fedora/CachyOS; apt: Ubuntu/Debian).
-    /// Missing-ness is checked by BINARY name (distro-independent); the
-    /// package name is mapped per distro.
-    fn packages(&self, pm: &str) {
-        println!("==> [1/4] host packages (virtiofsd, cloud-init, genisoimage, iproute, qemu-img, iptables, libguestfs)");
-        // (binary to check, dnf package, apt package)
-        let specs: [(&str, &str, &str); 7] = [
-            ("virtiofsd", "virtiofsd", "virtiofsd"),
-            ("cloud-init", "cloud-init", "cloud-init"),
-            ("genisoimage", "genisoimage", "genisoimage"),
-            ("ip", "iproute", "iproute2"),
-            ("qemu-img", "qemu-img", "qemu-utils"),
-            ("iptables", "iptables", "iptables"),
-            ("guestfish", "libguestfs", "libguestfs-tools"),
+    /// Host requirements, checked by BINARY name (distro-independent).
+    /// No auto-install: missing packages are reported with the exact command
+    /// for the detected package manager (README has the per-distro lists).
+    /// Returns false (run aborts) when anything is missing.
+    fn requirements(&self, pm: Option<&str>) -> bool {
+        println!("==> [1/4] host requirements (virtiofsd, cloud-init, genisoimage, iproute, qemu-img, iptables, libguestfs)");
+        // (binary to check, dnf package, apt package, note)
+        let specs: [(&str, &str, &str, &str); 7] = [
+            ("virtiofsd", "virtiofsd", "virtiofsd", ""),
+            ("cloud-init", "cloud-init", "cloud-init", ""),
+            ("genisoimage", "genisoimage", "genisoimage", ""),
+            ("ip", "iproute", "iproute2", ""),
+            ("qemu-img", "qemu-img", "qemu-utils", ""),
+            ("iptables", "iptables", "iptables", ""),
+            ("guestfish", "libguestfs", "libguestfs-tools", " (bake only)"),
         ];
-        let missing: Vec<String> = specs
+        let missing: Vec<(&str, &str, &str, &str)> = specs
             .iter()
-            .filter(|(bin, _, _)| {
+            .filter(|(bin, _, _, _)| {
                 if *bin == "virtiofsd" {
                     virtiofsd_path().is_none()
                 } else {
                     !run_ok("which", &[*bin])
                 }
             })
-            .map(|(_, dnf, apt)| if pm == "dnf" { dnf.to_string() } else { apt.to_string() })
+            .map(|s| (s.0, s.1, s.2, s.3))
             .collect();
         if missing.is_empty() {
-            println!("   all packages already installed");
-            return;
+            println!("   all host requirements present");
+            return true;
         }
-        println!("   installing: {}", missing.join(", "));
-        if pm == "apt" {
-            // best effort: a stale index is the usual apt install failure
-            self.priv_run(&["apt-get", "update", "-qq"]);
+        println!("   missing: {}", missing.iter().map(|m| format!("{}{}", m.0, m.3)).collect::<Vec<_>>().join(", "));
+        match pm {
+            Some("dnf") => println!("   install with:  dnf install -y {}", missing.iter().map(|m| m.1).collect::<Vec<_>>().join(" ")),
+            Some("apt") => println!("   install with:  apt-get install -y {}", missing.iter().map(|m| m.2).collect::<Vec<_>>().join(" ")),
+            None => println!("   (no dnf/apt-get detected — install the missing binaries with your package manager of choice)"),
+            Some(other) => println!("   (detected {other} but it is not dnf/apt — install the missing binaries with your package manager of choice)"),
         }
-        let mut args: Vec<String> = if pm == "dnf" {
-            vec!["dnf".into(), "install".into(), "-y".into()]
-        } else {
-            vec!["apt-get".into(),
-                "-o".into(), "DEBIAN_FRONTEND=noninteractive".into(),
-                "install".into(), "-y".into()]
-        };
-        args.extend(missing);
-        // privileged (auto-sudo when not root); a failure ABORTS (v1's behavior)
-        let status = self.priv_status(&args);
-        match status {
-            Ok(s) if s.success() => println!("   installed"),
-            Ok(s) => {
-                eprintln!("   ERROR: {pm} install exited with {s} — re-run `pi-vm install`");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("   ERROR: {pm} install: {e} — re-run `pi-vm install`");
-                std::process::exit(1);
-            }
-        }
+        false
     }
 
-    /// Run a command, auto-sudo when not root (status only).
-    fn priv_status(&self, args: &[String]) -> std::io::Result<std::process::ExitStatus> {
-        if crate::util::is_root() {
-            std::process::Command::new(&args[0]).args(&args[1..]).status()
-        } else {
-            let mut sa: Vec<String> = vec!["sudo".into()];
-            sa.extend(args.iter().cloned());
-            std::process::Command::new(&sa[0]).args(&sa[1..]).status()
-        }
-    }
-
-    /// Run a best-effort command (auto-sudo when not root).
-    fn priv_run(&self, args: &[&str]) {
-        let mut full: Vec<String> = if crate::util::is_root() {
-            vec![args[0].to_string()]
-        } else {
-            vec!["sudo".to_string(), args[0].to_string()]
-        };
-        full.extend(args[1..].iter().map(|s| s.to_string()));
-        let _ = self.priv_status(&full);
-    }
-
+    /// Locate the Cloud Hypervisor binary: $CH_BIN (explicit) > existing
+    /// assets copy (version-verified at download) > PATH (a distro or
+    /// terrapkg install — symlinked into assets) > static download.
     fn ch_binary(&self, home: &VmHome) {
-        println!("==> [2/4] Cloud Hypervisor static binary");
+        println!("==> [2/4] Cloud Hypervisor binary");
         let bin = home.ch_binary();
         let _ = std::fs::create_dir_all(home.assets_dir());
+        // $CH_BIN: an explicit existing binary wins. A stale symlink is
+        // replaced; a real assets file is kept (and reported below).
+        if let Ok(custom) = std::env::var("CH_BIN") {
+            let custom = std::path::Path::new(&custom);
+            if custom.exists() {
+                match std::fs::read_link(&bin) {
+                    Ok(p) if p != custom => { let _ = std::fs::remove_file(&bin); } // stale symlink: replace
+                    Ok(_) => { self.ch_report(&bin); return; }                    // already wired
+                    Err(_) if bin.exists() => { self.ch_report(&bin); return; } // real file: keep
+                    Err(_) => {} // no file yet: fall through and symlink
+                }
+                if std::os::unix::fs::symlink(custom, &bin).is_ok() {
+                    println!("   CH from $CH_BIN: {custom:?}");
+                    self.ch_report(&bin);
+                    return;
+                }
+                eprintln!("   WARN: could not symlink {bin:?} -> {custom:?}");
+            } else {
+                eprintln!("   WARN: $CH_BIN={custom:?} does not exist — ignoring");
+            }
+        }
         if bin.exists() {
-            let v = std::process::Command::new(&bin)
-                .arg("--version")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("?").to_string())
-                .unwrap_or_else(|_| "?".into());
-            println!("   CH already present: {bin:?} ({v})");
+            self.ch_report(&bin);
             return;
         }
+        // PATH (e.g. terrapkg or a distro package)
+        if let Ok(o) = run("which", &["cloud-hypervisor"])
+            && let Some(path) = o.lines().next().map(|s| s.to_string())
+            && std::os::unix::fs::symlink(&path, &bin).is_ok()
+        {
+            println!("   CH found on PATH: {path} (symlinked into assets)");
+            self.ch_report(&bin);
+            return;
+        }
+        self.ch_download(&bin);
+    }
+
+    fn ch_report(&self, bin: &std::path::Path) {
+        let v = std::process::Command::new(bin)
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("?").to_string())
+            .unwrap_or_else(|_| "?".into());
+        println!("   CH present: {bin:?} ({v})");
+    }
+
+    fn ch_download(&self, bin: &std::path::Path) {
         println!("   downloading cloud-hypervisor {CH_VERSION} ...");
         let url = format!("https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/{CH_VERSION}/cloud-hypervisor-static");
         let part = format!("{}.part", bin.display());
         if run_ok("curl", &["-fL", "--progress-bar", "-o", &part, &url]) {
             run_ok("chmod", &["+x", &part]);
-            if std::fs::rename(&part, &bin).is_ok() {
+            if std::fs::rename(&part, bin).is_ok() {
                 println!("   saved: {bin:?}");
             } else {
                 eprintln!("   ERROR: rename {part} -> {bin:?} failed");
