@@ -279,16 +279,21 @@ pi-vm version           CLI + CH versions, image hashes
   NOT a copy of the pi-vm source in the image: it would go stale at bake
   time, and "what am I?" is a data file, not a codebase to grep.)
 - [ ] extract the AUTOMATED usage (the autoresearch loop) into a separate
-  project — the interactive agent-VM features (prompt VMs, `send`, tmux,
-  `--prompt-file`) STAY in pi-vm. The loop: per run, plant prompt +
-  inputs into a copy of the baked image (guestfish — already a host
-  requirement), boot via `pi-vm create --no-mount` (no virtiofs needed
-  for this use case — skip the shared dir entirely), a boot script runs
-  `pi "<prompt>"` and powers off (the PI_VM_SERVICE pattern), collect
-  outputs + session jsonl via guestfish, keep the disk image as the
-  artifact. Open: CoW backing files vs full copy per run, artifact shape,
-  repo location. Fan-out works on the existing verified machinery
-  (parallel create + subnet allocation).
+  project. The prompt-VM machinery is NOT a human feature — `--prompt-file`
+  / the prompt.txt trigger / `send` / the tmux 'agent' session /
+  LAUNCH_SCRIPT / the PI_VM_SERVICE poweroff semantics were built for
+  autoresearch and move out (the human surface — create lands in pi or a
+  shell, resume, attach, --timeout, --rm — stays in the core). The loop
+  design (no virtiofs at all): per run, copy the baked image, plant
+  prompt + inputs via guestfish (already a host requirement), boot via
+  `pi-vm create --no-mount`, a boot script runs `pi "<prompt>"` and
+  powers off, collect outputs + session jsonl via guestfish, keep the
+  disk image as the artifact. Steering a running agent (the "send"
+  capability) is the loop project's, via an RPC-over-TCP bridge (`pi
+  --mode rpc` wrapped over a socket) — no tmux keystrokes. Open: CoW
+  backing files vs full copy per run, artifact shape, repo location.
+  Fan-out works on the existing verified machinery (parallel create +
+  subnet allocation).
 - [ ] reuse between `bake.rs` and `vm.rs` if possible — the guest
   net/ssh/mount setup is duplicated between the baked `pi-vm-net` unit
   and the cloud-init `user_data` runcmd
