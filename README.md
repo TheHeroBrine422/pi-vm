@@ -270,6 +270,14 @@ pi-vm version           CLI + CH versions, image hashes
 - [x] `install`: find a `cloud-hypervisor` already on `PATH` (e.g. a
   terrapkg install) before downloading the static binary ($CH_BIN >
   existing assets copy > PATH > download)
+- [ ] give the agent more info about its own environment: write a small
+  `vminfo.json` (subset of the host's meta.json: id, vcpus/memory/disk,
+  subnet/ip/mac, project semantics — shared path + uid squash, host os +
+  CH version, the create flags) into `<project>/.pi-vm/` before boot;
+  referenced from the baked AGENTS.md. `--no-mount` VMs: via the ISO for
+  now, via the config disk (see the performance item) later. (Deliberately
+  NOT a copy of the pi-vm source in the image: it would go stale at bake
+  time, and "what am I?" is a data file, not a codebase to grep.)
 - [ ] extract the agent-VM machinery (`--prompt-file`, the `send`
   subcommand, the tmux 'agent' session, the launch script, the agent
   branches in `boot()`) into a separate project — likely a separate crate;
