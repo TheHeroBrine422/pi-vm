@@ -278,12 +278,17 @@ pi-vm version           CLI + CH versions, image hashes
   now, via the config disk (see the performance item) later. (Deliberately
   NOT a copy of the pi-vm source in the image: it would go stale at bake
   time, and "what am I?" is a data file, not a codebase to grep.)
-- [ ] extract the agent-VM machinery (`--prompt-file`, the `send`
-  subcommand, the tmux 'agent' session, the launch script, the agent
-  branches in `boot()`) into a separate project — likely a separate crate;
-  needs planning (the seam: a running VM + ssh + the baked pi; the agent
-  project would own the supervisor via `pi-vm resume --timeout` and the
-  agent interface, e.g. an RPC-over-TCP bridge instead of tmux keystrokes)
+- [ ] extract the AUTOMATED usage (the autoresearch loop) into a separate
+  project — the interactive agent-VM features (prompt VMs, `send`, tmux,
+  `--prompt-file`) STAY in pi-vm. The loop: per run, plant prompt +
+  inputs into a copy of the baked image (guestfish — already a host
+  requirement), boot via `pi-vm create --no-mount` (no virtiofs needed
+  for this use case — skip the shared dir entirely), a boot script runs
+  `pi "<prompt>"` and powers off (the PI_VM_SERVICE pattern), collect
+  outputs + session jsonl via guestfish, keep the disk image as the
+  artifact. Open: CoW backing files vs full copy per run, artifact shape,
+  repo location. Fan-out works on the existing verified machinery
+  (parallel create + subnet allocation).
 - [ ] reuse between `bake.rs` and `vm.rs` if possible — the guest
   net/ssh/mount setup is duplicated between the baked `pi-vm-net` unit
   and the cloud-init `user_data` runcmd
