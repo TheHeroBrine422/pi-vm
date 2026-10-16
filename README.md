@@ -279,21 +279,22 @@ pi-vm version           CLI + CH versions, image hashes
   NOT a copy of the pi-vm source in the image: it would go stale at bake
   time, and "what am I?" is a data file, not a codebase to grep.)
 - [ ] extract the AUTOMATED usage (the autoresearch loop) into a separate
-  project. The prompt-VM machinery is NOT a human feature — `--prompt-file`
-  / the prompt.txt trigger / `send` / the tmux 'agent' session /
-  LAUNCH_SCRIPT / the PI_VM_SERVICE poweroff semantics were built for
-  autoresearch and move out (the human surface — create lands in pi or a
-  shell, resume, attach, --timeout, --rm — stays in the core). The loop
+  project. History (6d62198 -> 9f46cde -> cb6f188): the prompt-VM
+  machinery (headless prompt run -> --prompt-file/prompt.txt trigger,
+  send, tmux 'agent', LAUNCH_SCRIPT) is the autoresearch interface that
+  grew inside pi-vm, not a human feature — it moves out. The human
+  surface stays: create lands in pi or a shell, resume, attach,
+  --timeout, --rm, ls/rm/fetch/logs (fetch was added for host-side audit
+  snapshots of guest artifacts — the loop uses the same pattern), plus
+  the fan-out machinery (parallel create + subnet allocation). The loop
   design (no virtiofs at all): per run, copy the baked image, plant
-  prompt + inputs via guestfish (already a host requirement), boot via
-  `pi-vm create --no-mount`, a boot script runs `pi "<prompt>"` and
-  powers off, collect outputs + session jsonl via guestfish, keep the
-  disk image as the artifact. Steering a running agent (the "send"
-  capability) is the loop project's, via an RPC-over-TCP bridge (`pi
-  --mode rpc` wrapped over a socket) — no tmux keystrokes. Open: CoW
+  prompt + inputs via guestfish, boot via `pi-vm create --no-mount`, a
+  boot script runs `pi "<prompt>"` and powers off, collect outputs +
+  session jsonl (host copy = audit trail; the agent can tamper with the
+  guest copy) via guestfish, keep the disk image as the artifact.
+  `pi/AGENTS.md` STAYS in the core (it is the daily driver's system
+  prompt — the loop runs on the same baked pi config). Open: CoW
   backing files vs full copy per run, artifact shape, repo location.
-  Fan-out works on the existing verified machinery (parallel create +
-  subnet allocation).
 - [ ] reuse between `bake.rs` and `vm.rs` if possible — the guest
   net/ssh/mount setup is duplicated between the baked `pi-vm-net` unit
   and the cloud-init `user_data` runcmd
