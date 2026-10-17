@@ -90,6 +90,21 @@ the docker number.
   samples (create 19.0, parallel 18.3, resume 21.0/18.2) vs the 0.5 s
   build (19.3 / 18.0 / 18.8–19.6) — the 0.25 s quantization saving is
   inside the ±2 s run-to-run noise. Kept the 500 ms cadence.
+- 2026-10-17 **systemd graph trim (b) — no candidates**: the bake's
+  runcmd already detached every heavy multi-user want (docker, chronyd,
+  auditd, sssd, lvm2-monitor, qemu-guest-agent); the remaining on-path
+  units (udev, journal, sysctl, tmpfiles, hwdb) are standard and
+  required — the critical chain to sshd is basic.target itself. zram +
+  lvm2-monitor appear in `blame` but are off the critical path; masking
+  anything else would break functionality (udev/journal are needed by
+  the pi-vm-net diagnostics).
+- 2026-10-17 **pi-vm-net: pidof-guarded NM/resolved disable (c, KEPT —
+  not measurable but a strict reduction)**: 3 gate samples (create 20.6,
+  parallel 17.5, resume 21.3/19.7) vs the previous build (19.0 / 18.3 /
+  21.0/18.7) — inside the host-drift noise (one 74.4 s resume outlier =
+  the documented 3-way contention case). Kept because the change only
+  removes work (two full `systemctl disable --now` ops → two ~ms `pidof`
+  checks; the disable still fires on image drift) — nothing to lose.
 
 ## Idea queue (user + self; test when reached)
 

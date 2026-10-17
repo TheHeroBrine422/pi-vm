@@ -811,10 +811,12 @@ net_done=0
 ssh_done=0
 grow_done=0
 
-# 0. keep the interface under manual control (cheap no-ops after the
-#    bake disabled both; guards against image drift).
-systemctl disable --now NetworkManager 2>/dev/null || true
-systemctl disable --now systemd-resolved 2>/dev/null || true
+# 0. keep the interface under manual control (the bake disabled both; the
+#    pidof guard makes the common case two ~ms /proc checks instead of
+#    two full systemctl disable operations — ~0.5-1 s each against a
+#    cold systemd; the disable still fires on image drift).
+pidof NetworkManager > /dev/null 2>&1 && systemctl disable --now NetworkManager 2>/dev/null
+pidof systemd-resolved > /dev/null 2>&1 && systemctl disable --now systemd-resolved 2>/dev/null
 
 # 0b. docker: the toolchain's autostart (see the check header) —
 #    non-blocking + idempotent (a running unit is a no-op start).
