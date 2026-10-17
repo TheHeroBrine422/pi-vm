@@ -1069,13 +1069,15 @@ fn dnsmasq_running(pid_file: &std::path::Path) -> bool {
 }
 
 /// Write + (re)start the dedicated dnsmasq (privileged — raw sockets).
+/// Returns Err when it does not come up (the caller decides: install
+/// warns, boot fails fast).
 fn ensure_dnsmasq(home: &VmHome) -> Result<(), String> {
     let (conf, leases, pid) = dnsmasq_files(home);
     let text = format!(
         "port=0\nno-resolv\nbind-interfaces\ninterface={BRIDGE}\n\
          dhcp-range={POOL_START},{POOL_END},255.240.0.0,12h\n\
          dhcp-option=3,{BRIDGE_IP}\n\
-         lease-file={}\n\
+         dhcp-leasefile={}\n\
          pid-file={}\n\
          domain-needed\nbogus-priv\n",
         leases.display(),
@@ -1092,10 +1094,7 @@ fn ensure_dnsmasq(home: &VmHome) -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(200));
     }
-    // Best effort: a failure here surfaces as "no lease within the
-    // deadline" at boot with a pointer at `pi-vm install`.
-    eprintln!("   (dnsmasq did not start — VMs will not get a lease; re-run `pi-vm install`)");
-    Ok(())
+    Err("dnsmasq did not start — re-run `pi-vm install` (or check the log above)".to_string())
 }
 
 /// Bring up the shared bridge + dnsmasq + pool-wide iptables rules
