@@ -596,7 +596,7 @@ fi
         r#"
 exec >> /root/bake-debug.log 2>&1;
 echo "pi-vm baking toolchain...";
-(timeout 300 dnf install -y git curl wget ripgrep fd xz bzip2 tar gzip xfsprogs python3 python3-pip cargo uv which cloud-utils-growpart btrfs-progs dhclient 2>&1 | tail -3;
+(timeout 300 dnf install -y git curl wget ripgrep fd xz bzip2 tar gzip xfsprogs python3 python3-pip cargo uv which cloud-utils-growpart btrfs-progs 2>&1 | tail -3;
  echo "dnf1 rc=${{PIPESTATUS[0]}}") || true;
 (timeout 600 dnf install -y docker docker-compose 2>&1 | tail -2;
  systemctl enable --now docker 2>&1 | tail -1;
@@ -663,17 +663,19 @@ const NET_SCRIPT: &str = r#"#!/bin/sh
 # as the underlying devices are ready, and self-heals (e.g. the udev
 # interface-rename race) continuously for a minute. Idempotent.
 #
-# The guest's only per-VM knowledge is its own MAC (set by the host on
-# the TAP); its address comes from the host's dnsmasq on the shared
-# bridge (pi-vm ensure_shared_network). The ssh key + config are baked
-# (pi-vm bake --ssh-key). No cloud-init / NoCloud ISO is involved.
+# The guest's only per-VM knowledge is its config disk (CH's second
+# disk, deterministically /dev/vdb): the host writes vm-ip/vm-gw/vm-mac
+# before every boot (static pool assignment — no DHCP). The ssh key +
+# config are baked (pi-vm bake --ssh-key). No cloud-init / NoCloud ISO
+# is involved.
 #
 # The checks:
-#   0. NM/resolved   -> disabled (the interface stays under dhclient's
-#                      manual control — idempotent, already off at bake)
+#   0. NM/resolved   -> disabled (the interface stays under manual
+#                      control — idempotent, already off at bake)
 #   1. virtiofs      -> /workspace (the shared dir; N/A for --no-mount)
-#   2. network       -> a DHCP lease on the virtio NIC (kick dhclient if
-#                      there is no 172.16.x.x address yet)
+#   2. network       -> static config from the per-VM config disk
+#                      (/dev/vdb, written by the host before boot:
+#                      vm-ip / vm-gw / vm-mac / instance-id)
 #   3. ssh           -> sshd running (key + config baked)
 #   4. disk grow     -> root partition + btrfs fs fill the resized disk
 set -u
@@ -705,16 +707,31 @@ for i in $(seq 1 60); do
     fi
   fi
 
-  # 2. network: a DHCP lease (dhclient also writes /etc/resolv.conf with
-  #    the DNS servers — resolved is off, so that file is the only one).
-  #    dhclient daemonizes and holds the lease; start it when no address
-  #    is up yet (covers the first-boot race where the NIC appears after
-  #    any early start attempt, and a stale state after resume).
-  if [ "$net_done" -eq 0 ]; then
-    if ip -4 addr show 2>/dev/null | grep -q "inet 172\.16\."; then
-      net_done=1
-    elif ! pidof dhclient >/dev/null 2>&1; then
-      dhclient 2>/dev/null || true
+  # 2. network: read the per-VM config disk (deterministic /dev/vdb —
+  #    the host writes vm-ip/vm-gw/vm-mac before boot; a plain read, no
+  #    mount) and statically configure. The MAC-based NIC lookup survives
+  #    an interface rename (the MAC is unchanged). Also writes the DNS
+  #    servers (resolved is off, so /etc/resolv.conf is the only one).
+  if [ "$net_done" -eq 0 ] && [ -b /dev/vdb ]; then
+    CFG=$(head -c 4096 /dev/vdb 2>/dev/null | tr -d '\0')
+    IP=$(printf '%s\n' "$CFG" | grep "^vm-ip=" | cut -d= -f2)
+    GW=$(printf '%s\n' "$CFG" | grep "^vm-gw=" | cut -d= -f2)
+    MAC=$(printf '%s\n' "$CFG" | grep "^vm-mac=" | cut -d= -f2)
+    if [ -n "$IP" ]; then
+      IF=$(for x in /sys/class/net/*; do
+        n=$(basename "$x")
+        case "$n" in lo|docker*|br-*|tap-*) ;; *)
+          grep -qi "$MAC" "$x/address" 2>/dev/null && echo "$n";;
+        esac;
+      done | head -1)
+      [ -n "$IF" ] || IF=$(ls /sys/class/net 2>/dev/null | grep -vE "^lo$|^docker|^br-|^tap-" | head -1)
+      if [ -n "$IF" ]; then
+        ip addr replace "$IP/24" dev "$IF" 2>/dev/null
+        ip link set "$IF" up 2>/dev/null
+        ip route replace default via "$GW" 2>/dev/null
+        printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+        ip -4 addr show dev "$IF" 2>/dev/null | grep -qF "$IP" && net_done=1
+      fi
     fi
   fi
 
@@ -754,18 +771,27 @@ for i in $(seq 1 60); do
     fi
   fi
 
-  # converged? exit early (a healthy VM breaks at ~iteration 2-3, once
-  # the DHCP lease lands).
+  # converged? exit early (a healthy VM breaks at ~iteration 1-2, the
+  # config disk is a small read once /dev/vdb exists).
   if [ "$vfs_done" -eq 1 ] && [ "$net_done" -eq 1 ] && [ "$ssh_done" -eq 1 ] && [ "$grow_done" -eq 1 ]; then
     break
   fi
   sleep 1
 done
 
+# diagnostics: a silent exit here would leave the VM unaddressable with
+# no trace (ssh just never comes up). One line to the journal when the
+# network did not converge, with everything needed to tell which half
+# failed (host side: config.raw; guest side: /dev/vdb / NIC / ip tools).
+if [ "$net_done" -eq 0 ]; then
+  if [ -b /dev/vdb ]; then VDB=present; else VDB=MISSING; fi
+  echo "pi-vm-net: WARNING network not configured after 60s (vdb=$VDB cfg=[$(head -c 4096 /dev/vdb 2>/dev/null | tr -d '\0' | tr '\n' '|')])"
+fi
+
 exit 0
 "#;
 
-const NET_SERVICE: &str = "[Unit]\nDescription=pi-vm per-boot setup (DHCP + ssh + virtiofs + disk grow on the shared bridge)\nConditionPathExists=/usr/local/bin/pi-vm-net.sh\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=180\nExecStartPre=-/usr/bin/restorecon /usr/local/bin/pi-vm-net.sh\nExecStartPre=/usr/bin/chcon -t bin_t /usr/local/bin/pi-vm-net.sh\nExecStart=/usr/local/bin/pi-vm-net.sh\n";
+const NET_SERVICE: &str = "[Unit]\nDescription=pi-vm per-boot setup (config-disk network + ssh + virtiofs + disk grow on the shared bridge)\nConditionPathExists=/usr/local/bin/pi-vm-net.sh\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=180\nExecStartPre=-/usr/bin/restorecon /usr/local/bin/pi-vm-net.sh\nExecStartPre=/usr/bin/chcon -t bin_t /usr/local/bin/pi-vm-net.sh\nExecStart=/usr/local/bin/pi-vm-net.sh\n";
 
 // Repeating timer + ConditionPathExists (on the service): robust across hosts
 // with NO fixed time guess. The timer ticks every 1 s; the service only runs

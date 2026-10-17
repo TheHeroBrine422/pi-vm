@@ -1,7 +1,7 @@
 //! `pi-vm install` — one-time host-side setup (port of vm/setup.sh).
 //!
 //!   1. checks host requirements (virtiofsd, genisoimage, iproute,
-//!      qemu-img, iptables, libguestfs, dnsmasq) and prints the exact
+//!      qemu-img, iptables, libguestfs) and prints the exact
 //!      install command for anything missing — the user runs their own
 //!      package manager (the package list is in the README)
 //!   2. locates the Cloud Hypervisor binary: $CH_BIN > existing assets
@@ -44,16 +44,15 @@ impl Install {
     /// packages are reported with the exact dnf command (README has the
     /// package list). Returns false (run aborts) when anything is missing.
     fn requirements(&self, pm: Option<&str>) -> bool {
-        println!("==> [1/5] host requirements (virtiofsd, genisoimage, iproute, qemu-img, iptables, libguestfs, dnsmasq)");
+        println!("==> [1/5] host requirements (virtiofsd, genisoimage, iproute, qemu-img, iptables, libguestfs)");
         // (binary to check, dnf package, note)
-        let specs: [(&str, &str, &str); 7] = [
+        let specs: [(&str, &str, &str); 6] = [
             ("virtiofsd", "virtiofsd", ""),
             ("genisoimage", "genisoimage", " (bake only)"),
             ("ip", "iproute", ""),
             ("qemu-img", "qemu-img", ""),
             ("iptables", "iptables", ""),
             ("guestfish", "libguestfs", " (bake only)"),
-            ("dnsmasq", "dnsmasq", ""),
         ];
         let missing: Vec<(&str, &str, &str)> = specs
             .iter()
@@ -79,15 +78,16 @@ impl Install {
         false
     }
 
-    /// The shared VM network: one bridge + one dedicated dnsmasq serve
-    /// every VM (the boot path self-heals the same setup — this just
-    /// does it up front with a clear status line).
+    /// The shared VM network: one bridge serves every VM (each VM adds a
+    /// TAP + a static pool IP on its config disk). The boot path
+    /// self-heals the same setup — this just does it up front with a
+    /// clear status line.
     fn shared_network(&self, home: &VmHome) {
-        println!("==> [2/5] shared VM network (br-pi-vm + dnsmasq)");
+        println!("==> [2/5] shared VM network (br-pi-vm bridge)");
         match crate::vm::ensure_shared_network(home) {
             Ok(()) => {
                 let hn = crate::vm::host_net(home);
-                println!("   bridge + dnsmasq up (pool {} — chosen to avoid live host subnets; inter-VM traffic is blocked)", hn.pool)
+                println!("   bridge up (pool {} — per-VM static IPs from the pool, chosen to avoid live host subnets; inter-VM traffic is isolated)", hn.pool)
             }
             Err(e) => eprintln!("   WARN: shared network setup failed: {e} (the boot path will retry)"),
         }

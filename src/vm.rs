@@ -117,11 +117,14 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     }
 
     let id = state::new_id();
-    // Shared-bridge DHCP networking: the MAC is host-side only (the
-    // supervisor matches the dnsmasq lease on it); the address comes from
-    // the guest's DHCP lease (the wait loop in boot).
+    // Shared-bridge static networking: the MAC is host-side only and the
+    // address is a static pick from the host pool — both travel to the
+    // guest on the per-VM config disk (write_config_disk; the baked
+    // pi-vm-net script reads /dev/vdb). No DHCP, no lease polling.
     let mac = state::random_mac();
     let hn = host_net(home);
+    let ip = allocate_ip(home, &hn.pool)?;
+    let pool = hn.pool.clone();
     let squash = match cfg.squash_uid {
         Some(u) => u,
         None => match &cfg.project {
@@ -144,8 +147,8 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
                 .map(|c| c.to_string_lossy().to_string())
                 .unwrap_or_else(|_| p.clone())
         }),
-        subnet: hn.pool,
-        ip: String::new(),
+        subnet: pool,
+        ip,
         mac,
         vcpus: cfg.vcpus,
         memory_mb: cfg.memory_mb,
@@ -155,11 +158,12 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
         base_image_sha256,
         state: VmState::Stopped,
         ch_pid: None,
-        net_gen: Some(2),
+        net_gen: Some(3),
     };
     let dir = meta.vm_dir(home);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     meta.save(home)?;
+    write_config_disk(home, &meta, &hn)?;
 
     // disk: copy pre-baked base + resize (fs grows on boot via the
     // runcmd / pi-vm-net growpart + btrfs resize — idempotent)
@@ -296,15 +300,15 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     let _lock = state::VmLock::acquire(&meta, home)
         .map_err(BootFail::InUse)?;
 
-    // VMs created by an older pi-vm (legacy per-VM /24 + NoCloud ISO,
-    // or an early shared-bridge build without the net_gen marker): their
-    // disks carry the old baked image, whose pi-vm-net script looks for
-    // the NoCloud ISO config — gone now. Fail fast with a clear pointer
-    // instead of burning the 300 s ssh deadline.
+    // VMs created by an older pi-vm (legacy per-VM /24 + NoCloud ISO, the
+    // DHCP-era build, or any other generation): their disks carry an old
+    // baked image whose pi-vm-net script looks for the old network config
+    // (the NoCloud ISO / a DHCP lease) — gone now. Fail fast with a clear
+    // pointer instead of burning the 300 s ssh deadline.
     if state::is_legacy_networking(&meta) {
         return Err(BootFail::Preflight(format!(
-            "VM {} was created by an older pi-vm (its meta predates the shared-bridge DHCP networking; recorded subnet: {}) and its disk still carries the old baked image — it cannot find its network config (the NoCloud ISO is gone). Recreate it: `pi-vm rm <id>` then `pi-vm create <same-path>` on the re-baked image (project data lives on the host; only the guest rootfs is replaced)",
-            meta.id, meta.subnet
+            "VM {} was created by an older pi-vm (networking generation {}; recorded subnet: {}) and its disk still carries the old baked image — it cannot find its network config (the NoCloud ISO / DHCP are gone). Recreate it: `pi-vm rm <id>` then `pi-vm create <same-path>` on the re-baked image (project data lives on the host; only the guest rootfs is replaced)",
+            meta.id, meta.net_gen.unwrap_or(0), meta.subnet
         )));
     }
 
@@ -344,7 +348,8 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     }
 
     // --- network (idempotent, privileged via auto-sudo) ---
-    // Shared bridge + dnsmasq serve every VM; this VM gets its own TAP.
+    // Shared bridge serves every VM; this VM gets its own TAP + a static
+    // pool IP (written to the config disk by create_vm).
     ensure_shared_network(home).map_err(BootFail::Preflight)?;
     let tap = meta.tap_name();
     if !run_ok_priv("ip", &["link", "show", &tap]) {
@@ -359,8 +364,9 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
             run_ok_priv("chown", &[&user, &format!("/dev/{tap}")]);
         }
     // These must succeed — a down tap or a tap not enslaved to the bridge
-    // means the guest gets no DHCP lease, and the boot would burn the full
-    // ssh deadline with no diagnostics ("No route to host").
+    // means the guest can't reach its config + the host can't reach the
+    // guest, and the boot would burn the full ssh deadline with no
+    // diagnostics ("No route to host").
     run_priv("ip", &["link", "set", &tap, "master", BRIDGE])
         .map_err(BootFail::Preflight)?;
     run_priv("ip", &["link", "set", &tap, "up"])
@@ -460,6 +466,8 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     ch_args.extend(direct_args);
     ch_args.extend(["--disk".into(),
         format!("path={},image_type=qcow2", meta.disk_path(home).display()),
+        "--disk".into(),
+        format!("path={},image_type=raw,readonly=on", meta.vm_dir(home).join("config.raw").display()),
         "--net".into(),
         format!("tap={},mac={}", meta.tap_name(), meta.mac),
         "--console".into(),
@@ -526,14 +534,15 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     let tstp = Arc::new(AtomicBool::new(false));
     install_signal_handler(interrupted.clone(), terminated.clone(), tstp.clone());
 
-    // --- wait for the DHCP lease + ssh ---
-    let boot_deadline = 300;
-    let mut waited = 0;
+    // --- wait for ssh (the IP is known — static pool assignment) ---
+    // Respect --timeout (the VM can't be "ready" later than it is going
+    // to be killed anyway), capped at 300 s.
+    let boot_deadline = timeout_s.map(|t| t.min(300)).unwrap_or(300);
+    let mut waited = 0u64;
     let mut ready = false;
-    let mut lease_ip: Option<String> = None;
     while waited < boot_deadline {
-        thread::sleep(Duration::from_secs(2));
-        waited += 2;
+        thread::sleep(Duration::from_secs(1));
+        waited += 1;
         if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
             break;
         }
@@ -544,19 +553,10 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
             teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
             return Err(BootFail::BootFailed("CH exited during boot — see console.log".into()));
         }
-                if lease_ip.is_none()
-            && let Some(ip) = lease_ip_for(home, &meta.mac)
-        {
-            lease_ip = Some(ip.clone());
-            println!("   lease: {ip} (connect: ssh root@{ip})");
-            meta.ip = ip;
-            meta.updated = state::now();
-            let _ = meta.save(home);
-        }
-        if let Some(ip) = &lease_ip && tcp_open(ip, 22) {
+        if tcp_open(&meta.ip, 22) {
             let probe = Command::new("ssh")
                 .args(ssh_opts())
-                .arg(format!("root@{ip}"))
+                .arg(format!("root@{}", meta.ip))
                 .arg("true")
                 .output();
             if probe.map(|o| o.status.success()).unwrap_or(false) {
@@ -564,7 +564,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
                 break;
             }
         }
-        if waited % 20 == 0 {
+        if waited % 10 == 0 {
             print!("   booting… ({waited}s)");
             std::io::Write::flush(&mut std::io::stdout()).ok();
         }
@@ -576,11 +576,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
             teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
             return Err(BootFail::Interrupted("interrupted before ssh became reachable".into()));
         }
-        let lease_note = match lease_ip.as_deref() {
-            Some(ip) => ip.to_string(),
-            None => "none — check dnsmasq (re-run `pi-vm install`)".to_string(),
-        };
-        eprintln!("VM did not become ssh-reachable in {boot_deadline}s (DHCP lease: {lease_note}) — console tail:");
+        eprintln!("VM did not become ssh-reachable in {boot_deadline}s (ip {} — check config.raw + the console tail):", meta.ip);
         tail_file(&meta.console_path(home), 20);
         teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
         return Err(BootFail::SshUnreachable("boot timed out".into()));
@@ -1039,15 +1035,11 @@ pub fn libc_kill(pid: u32, sig: i32) {
 #[cfg(not(unix))]
 pub fn libc_kill(_pid: u32, _sig: i32) {}
 
-/// Shared-bridge networking constants: one bridge + one dnsmasq serve
-/// every VM on the host. The VM address space is a single /24 (gateway
-/// .1, pool .100-.254) in the 172.16.2-251 space, chosen ONCE at install
-/// time to not overlap any live host interface — a fixed 172.16.0.0/12
-/// pool would route into docker0's 172.17.0.0/16 ("No route to host").
-/// 172.16/16 is private (CGNAT-ish) space that never appears on the
-/// internet or a normal LAN. A nested pi-vm (inside one of these VMs)
-/// runs its own bridge + dnsmasq in its own chosen /24; the explicit
-/// `ip route` below makes the pool reachable at each level.
+/// The dnsmasq-free host network: one bridge + one chosen /24 pool serve
+/// every VM. Each VM gets a static IP from the pool (random free pick,
+/// like the old per-VM allocator but within one /24 — no live-interface
+/// check needed, the pool was chosen collision-free at install) delivered
+/// on a per-VM config disk; the gateway is the bridge IP.
 pub const BRIDGE: &str = "br-pi-vm";
 
 pub struct HostNet {
@@ -1124,8 +1116,8 @@ pub fn host_net(home: &VmHome) -> HostNet {
     hn
 }
 
-/// The dnsmasq pool range for a /24: .100-.254 (.1 is the gateway).
-fn pool_range(pool: &str) -> (String, String) {
+/// The pool's /24 octets (for allocate_ip; .1 is the gateway).
+fn pool_range(pool: &str) -> (u8, u8, u8) {
     let oct: Vec<u8> = pool
         .split('/')
         .next()
@@ -1138,97 +1130,63 @@ fn pool_range(pool: &str) -> (String, String) {
     } else {
         (172, 16, 2)
     };
-    (format!("{a}.{b}.{c}.100"), format!("{a}.{b}.{c}.254"))
+    (a, b, c)
 }
 
-/// The dedicated dnsmasq instance's files (own conf/lease/pid — a
-/// separate process, so it coexists with any system dnsmasq: ours binds
-/// ONLY to the bridge, and port=0 disables its DNS side).
-fn dnsmasq_files(home: &VmHome) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    (
-        home.root.join("dnsmasq.conf"),
-        home.root.join("dnsmasq.leases"),
-        home.root.join("dnsmasq.pid"),
-    )
+/// A static IP for a new VM: a random free address in the host pool
+/// (.2-.254; .1 is the gateway). "Free" = not recorded in any existing
+/// VM's meta (a stopped VM keeps its ip in meta.json until rm).
+/// Pick a static pool IP (random free .2-.254, avoiding other VMs' meta
+/// ips). The re-check loop closes the parallel-create race: a concurrent
+/// create can land on the same pick between our list and our save, so
+/// verify the pick is still unclaimed right before returning.
+pub fn allocate_ip(home: &VmHome, pool: &str) -> Result<String, String> {
+    let (a, b, c) = pool_range(pool);
+    for _ in 0..8 {
+        let used: Vec<String> = home
+            .list_vm_ids()
+            .iter()
+            .filter_map(|id| VmMeta::load(home, id).ok())
+            .filter_map(|m| if m.ip.is_empty() { None } else { Some(m.ip.clone()) })
+            .collect();
+        let free: Vec<u8> = (2..=254).filter(|n| !used.contains(&format!("{a}.{b}.{c}.{n}"))).collect();
+        if free.is_empty() {
+            return Err(format!("the VM pool {pool} is exhausted (no free .2-.254 address) — `pi-vm rm` some VMs"));
+        }
+        let ip = format!("{a}.{b}.{c}.{}", free[state::rand_below(free.len())]);
+        // Re-check the pick (a concurrent create may have claimed it).
+        let still_free: Vec<String> = home
+            .list_vm_ids()
+            .iter()
+            .filter_map(|id| VmMeta::load(home, id).ok())
+            .filter_map(|m| if m.ip.is_empty() { None } else { Some(m.ip.clone()) })
+            .collect();
+        if !still_free.contains(&ip) {
+            return Ok(ip);
+        }
+    }
+    Err(format!("could not allocate a free IP in {pool} (parallel creates are racing) — try again"))
 }
 
-/// Is the dedicated dnsmasq running (pidfile + live process whose cmdline
-/// mentions dnsmasq — a reused pid must not be trusted, same pattern as
-/// the rm --force ch_pid check).
-fn dnsmasq_running(pid_file: &std::path::Path) -> bool {
-    let pid = match read_pid(pid_file) {
-        Some(p) => p,
-        None => return false,
-    };
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
-        .unwrap_or_default();
-    cmdline.contains("dnsmasq")
-}
-
-fn read_pid(pid_file: &std::path::Path) -> Option<i32> {
-    std::fs::read_to_string(pid_file)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-}
-
-/// A running dnsmasq is stale when the config file is newer than the
-/// process start (the pidfile is written at start, so its mtime tracks
-/// the start closely enough).
-fn config_is_stale(pid_file: &std::path::Path, conf: &std::path::Path) -> Option<bool> {
-    use std::time::SystemTime;
-    let start = std::fs::metadata(pid_file).ok()?.modified().ok()?;
-    let conf_mt = std::fs::metadata(conf).ok()?.modified().ok()?;
-    let start_s = start.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).ok()?;
-    let conf_s = conf_mt.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).ok()?;
-    Some(conf_s > start_s)
-}
-
-/// Write + (re)start the dedicated dnsmasq (privileged — raw sockets).
-/// Returns Err when it does not come up (the caller decides: install
-/// warns, boot fails fast).
-fn ensure_dnsmasq(home: &VmHome) -> Result<(), String> {
-    let (conf, leases, pid) = dnsmasq_files(home);
-    let hn = host_net(home);
-    let (start, end) = pool_range(&hn.pool);
+/// Write the per-VM config disk (1 MB raw; plain text, NUL-padded — the
+/// guest reads it straight off /dev/vdb, no mount). Deterministic device
+/// position: it is CH's second disk, rootfs is first.
+pub fn write_config_disk(home: &VmHome, meta: &VmMeta, hn: &HostNet) -> Result<(), String> {
+    let path = meta.vm_dir(home).join("config.raw");
     let text = format!(
-        "port=0\nno-resolv\nbind-interfaces\ninterface={BRIDGE}\n\
-         dhcp-range={start},{end},255.255.255.0,12h\n\
-         dhcp-option=3,{}\n\
-         dhcp-leasefile={}\n\
-         pid-file={}\n\
-         domain-needed\nbogus-priv\n",
-        hn.gateway,
-        leases.display(),
-        pid.display()
+        "vm-ip={}\nvm-gw={}\nvm-mac={}\ninstance-id=pi-{}\n",
+        meta.ip, hn.gateway, meta.mac, meta.id
     );
-    std::fs::write(&conf, text).map_err(|e| format!("write {}: {e}", conf.display()))?;
-    if dnsmasq_running(&pid) {
-        // A running instance predating the config rewrite (e.g. a pool
-        // re-pick) is restarted so the new dhcp-range applies; a current
-        // one keeps running.
-        if config_is_stale(&pid, &conf).unwrap_or(false) {
-            if let Some(p) = read_pid(&pid) {
-                let _ = std::process::Command::new("kill").arg(p.to_string()).output();
-                thread::sleep(Duration::from_millis(300));
-            }
-        } else {
-            return Ok(());
-        }
-    }
-    let _ = run_priv("dnsmasq", &[&format!("--conf-file={}", conf.display())]);
-    for _ in 0..15 {
-        if dnsmasq_running(&pid) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    Err("dnsmasq did not start — re-run `pi-vm install` (or check the log above)".to_string())
+    use std::io::Write;
+    let mut f = std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    f.write_all(text.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.set_len(1 << 20).map_err(|e| format!("pad {}: {e}", path.display()))?;
+    Ok(())
 }
 
-/// Bring up the shared bridge + dnsmasq + pool-wide iptables rules
-/// (idempotent — boot calls this before every VM; `pi-vm install` calls
-/// it once ahead). Privileged via auto-sudo.
+/// Bring up the shared bridge + pool-wide iptables rules (idempotent —
+/// boot calls this before every VM; `pi-vm install` calls it once
+/// ahead). Privileged via auto-sudo.
 pub fn ensure_shared_network(home: &VmHome) -> Result<(), String> {
     let hn = host_net(home);
     if !run_ok_priv("ip", &["link", "show", BRIDGE]) {
@@ -1250,7 +1208,9 @@ pub fn ensure_shared_network(home: &VmHome) -> Result<(), String> {
     // Pool-wide iptables rules (idempotent). The inter-VM isolation DROP
     // must match BEFORE the accepts (first-match wins): VMs reach the
     // internet via NAT but not each other (the per-VM /24 design gave
-    // this by construction; on the shared bridge it is policy).
+    // this by construction; on the shared bridge it is policy — the real
+    // mechanism is bridge port isolation in boot(), this is the routed
+    // fallback).
     if run_ok("which", &["iptables"]) {
         if !run_ok_priv("iptables", &["-C", "FORWARD", "-i", BRIDGE, "-o", BRIDGE, "-j", "DROP"]) {
             run_ok_priv("iptables", &["-I", "FORWARD", "1", "-i", BRIDGE, "-o", BRIDGE, "-j", "DROP"]);
@@ -1267,51 +1227,19 @@ pub fn ensure_shared_network(home: &VmHome) -> Result<(), String> {
             run_ok_priv("iptables", &["-A", "FORWARD", "-o", BRIDGE, "-j", "ACCEPT"]);
         }
     }
-    ensure_dnsmasq(home)
-}
-
-/// The guest's address from the dnsmasq lease file (matched on the TAP's
-/// MAC — the one identifier the host knows before the guest boots).
-/// Lease lines: "<expiry> <mac> <ip> <hostname> <flags>" (2.92; older
-/// versions wrote ip before mac — the MAC is matched by shape, so both
-/// orders work). A MAC can have several lines (history); the last one is
-/// the current lease.
-pub fn lease_ip_for(home: &VmHome, mac: &str) -> Option<String> {
-    let leases = dnsmasq_files(home).1;
-    let s = std::fs::read_to_string(&leases).ok()?;
-    let is_mac = |t: &str| {
-        let p: Vec<&str> = t.split(':').collect();
-        p.len() == 6 && p.iter().all(|x| x.len() == 2 && x.chars().all(|c| c.is_ascii_hexdigit()))
-    };
-    let mut found = None;
-    for line in s.lines() {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 3 {
-            continue;
-        }
-        let (mac_f, ip_f) = if is_mac(f[1]) {
-            (f[1], f[2])
-        } else if is_mac(f[2]) {
-            (f[2], f[1])
-        } else {
-            continue;
-        };
-        if mac_f.eq_ignore_ascii_case(mac) {
-            found = Some(ip_f.to_string());
-        }
-    }
-    found
+    Ok(())
 }
 
 /// ssh options for talking to a VM's guest — the single source of truth
 /// for every ssh connection this tool makes (boot probe, attach,
 /// graceful poweroff, `pi-vm attach`): the host user's DEFAULT ssh key
 /// (the baked image trusts it — `pi-vm bake --ssh-key`), no host-key
-/// checking (the guest's host key is pi-vm's own, and the DHCP address
-/// can change between leases), BatchMode (so an interactive prompt can
-/// never hang the supervisor), and a bounded connection. The caller
-/// appends `[-t] root@<ip> <remote command...>` — `-t` must come BEFORE
-/// the target (ssh treats everything after the target as the command).
+/// checking (the guest's host key is pi-vm's own; it persists on the
+/// disk while the pool address can be re-assigned), BatchMode (so an
+/// interactive prompt can never hang the supervisor), and a bounded
+/// connection. The caller appends `[-t] root@<ip> <remote command...>` —
+/// `-t` must come BEFORE the target (ssh treats everything after the
+/// target as the command).
 pub fn ssh_opts() -> Vec<String> {
     vec![
         "-o".into(),
@@ -1414,7 +1342,7 @@ fn install_signal_handler(interrupted: Arc<AtomicBool>, terminated: Arc<AtomicBo
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_title, lease_ip_for, qemu_img_info_cleanly_closed};
+    use super::{attach_title, qemu_img_info_cleanly_closed};
     use crate::state::{VmHome, VmMeta, VmState};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1441,24 +1369,6 @@ mod tests {
             ch_pid: None,
             net_gen: Some(2),
         }
-    }
-
-    #[test]
-    fn lease_ip_matches_by_mac_both_orders() {
-        let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", crate::state::new_id()));
-        let home = VmHome { root: dir.clone() };
-        std::fs::create_dir_all(&dir).unwrap();
-        // 2.92 order (expiry mac ip) + the older order (expiry ip mac):
-        std::fs::write(
-            dir.join("dnsmasq.leases"),
-            "1792245916 52:54:00:61:c3:5a 172.17.11.87 * *\n\
-             1792245916 172.16.9.9 52:54:00:aa:bb:cc * *\n",
-        )
-        .unwrap();
-        assert_eq!(lease_ip_for(&home, "52:54:00:61:c3:5a").as_deref(), Some("172.17.11.87"));
-        assert_eq!(lease_ip_for(&home, "52:54:00:aa:bb:cc").as_deref(), Some("172.16.9.9"));
-        assert_eq!(lease_ip_for(&home, "52:54:00:00:00:00"), None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The clean-state check must not run the refcount rebuild on a

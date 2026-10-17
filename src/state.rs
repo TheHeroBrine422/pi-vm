@@ -126,12 +126,14 @@ pub struct VmMeta {
     /// e.g. the host's VM /24 pool (chosen at install, see host_net;
     /// legacy VMs record their per-VM 172.16.N.0/24 — the guard below)
     pub subnet: String,
-    /// The VM's DHCP lease address (last known; empty until first boot)
+    /// The VM's static pool address (allocated at create; the config disk
+    /// carries it to the guest)
     pub ip: String,
     /// e.g. 52:54:00:aa:bb:cc
     pub mac: String,
-    /// Networking generation (Some(2) = shared-bridge DHCP; old meta.json
-    /// files lack the field and deserialize to None = legacy per-VM /24).
+    /// Networking generation (Some(3) = shared-bridge config disk —
+    /// current; Some(2) = the DHCP-era build; old meta.json files lack
+    /// the field and deserialize to None = legacy per-VM /24 + ISO).
     #[serde(default)]
     pub net_gen: Option<u8>,
     pub vcpus: u32,
@@ -280,18 +282,18 @@ pub fn resolve(home: &VmHome, arg: &str) -> Result<VmMeta, String> {
 ///    masquerade the parent's own traffic (breaking the parent's
 ///    networking)"). Check both .1 and .2 — the .2 check catches a nested
 ///    VM colliding with its parent's NIC (which is 172.16.N.2).
-/// True for VMs created under the legacy per-VM /24 networking (a unique
-/// 172.16.N.0/24 per VM + NoCloud ISO config). Such VMs' disks carry the
-/// old baked pi-vm-net script and cannot boot on the shared-bridge DHCP
-/// network — resume refuses them with a clear message.
+/// True for VMs created by an older pi-vm (any generation before the
+/// current one — legacy per-VM /24 + NoCloud ISO, or the DHCP-era
+/// build): their disks carry an old baked pi-vm-net script that looks
+/// for the old network config (ISO / DHCP lease). Resume refuses them
+/// with a clear message.
 pub fn is_legacy_networking(meta: &VmMeta) -> bool {
-    meta.net_gen.is_none()
+    meta.net_gen != Some(3)
 }
 
 /// A random locally-administered MAC (the 52:54:00 OUI block keeps pi-vm
-/// TAPs identifiable in `ip link`). The MAC is host-side only: the guest
-/// learns its own address by DHCP (the supervisor matches the dnsmasq
-/// lease on this MAC).
+/// TAPs identifiable in `ip link`). The MAC travels on the TAP + the
+/// config disk (the guest matches it to find its own NIC).
 pub fn random_mac() -> String {
     let b = rand_bytes(3);
     format!("52:54:00:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2])
@@ -550,7 +552,8 @@ mod tests {
             net_gen,
         };
         assert!(is_legacy_networking(&mk(None))); // old meta.json: no net_gen field
-        assert!(!is_legacy_networking(&mk(Some(2)))); // shared-bridge DHCP
+        assert!(is_legacy_networking(&mk(Some(2)))); // the DHCP-era build
+        assert!(!is_legacy_networking(&mk(Some(3)))); // config-disk generation
     }
 
     #[test]
