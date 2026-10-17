@@ -450,7 +450,7 @@ impl Bake {
                 };
                 let ssh = std::path::Path::new(&home).join(".ssh");
                 match std::fs::read_dir(&ssh) {
-                    Ok(mut d) => d
+                    Ok(d) => d
                         .filter_map(|e| e.ok())
                         .map(|e| e.path())
                         .filter(|p| p.extension().is_some_and(|x| x == "pub"))
