@@ -11,14 +11,9 @@ use crate::vm::{boot, resume_vm};
 pub struct Resume {
     /// VM id, unique id prefix, or name
     pub target: String,
-    /// Attach to a plain shell in /workspace instead of starting the agent
+    /// Attach to a plain shell in /workspace instead of starting pi
     #[arg(long)]
     pub shell: bool,
-    /// Re-copy the agent prompt into <project>/prompt.txt (the seed of the
-    /// agent VM — the supervisor starts pi with it; a hand-placed
-    /// prompt.txt also makes the VM an agent VM)
-    #[arg(long)]
-    pub prompt_file: Option<String>,
     /// Stop the VM N seconds after launch
     #[arg(long)]
     pub timeout: Option<u64>,
@@ -41,31 +36,8 @@ impl Resume {
                 return 2;
             }
         };
-        let agent_mode = match &self.prompt_file {
-            Some(pf) => match &meta.project {
-                Some(p) => {
-                    let content = std::fs::read_to_string(pf).unwrap_or_else(|e| {
-                        eprintln!("error: cannot read prompt file {pf}: {e}");
-                        std::process::exit(2);
-                    });
-                    std::fs::write(std::path::Path::new(p).join("prompt.txt"), content)
-                        .unwrap_or_else(|e| {
-                            eprintln!("error: cannot write {p}/prompt.txt: {e}");
-                            std::process::exit(2);
-                        });
-                    true
-                }
-                None => {
-                    eprintln!("error: --prompt-file requires a shared project (this VM has no /workspace)");
-                    return 2;
-                }
-            },
-            None => meta.project.as_ref()
-                .map(|p| std::path::Path::new(p).join("prompt.txt").exists())
-                .unwrap_or(false),
-        };
         let rm_meta = meta.clone(); // for the --rm auto-delete after boot
-        match boot(home, meta, attach, self.shell, agent_mode, self.timeout, self.rm) {
+        match boot(home, meta, attach, self.shell, self.timeout, self.rm) {
             Ok(code) => {
                 if self.rm {
                     // Only a normal stop reaches here (attach session

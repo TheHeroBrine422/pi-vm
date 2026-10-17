@@ -288,16 +288,13 @@ fn attach_title_prefix(meta: &VmMeta) -> Option<String> {
 }
 
 /// Boot the VM and (if attach) drop into ssh. Returns the exit code.
-/// `agent_mode`: the shared project carries a prompt.txt — the pi-vm
-/// supervisor starts the tmux session 'agent' (pi with the prompt) over
-/// ssh, and
-/// attaches land in it. `timeout_s`: stop the VM N seconds after launch
+/// `timeout_s`: stop the VM N seconds after launch
 /// (the deadline starts now; boot time counts against it — pass a budget
 /// with a boot buffer). `rm`: the caller will auto-delete the VM after a
 /// normal stop (the --rm flag — only affects the stop message; the
 /// deletion itself happens in the caller, after the lock is released).
 pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
-           agent_mode: bool, timeout_s: Option<u64>, rm: bool) -> Result<i32, BootFail> {
+           timeout_s: Option<u64>, rm: bool) -> Result<i32, BootFail> {
     let boot_start = std::time::Instant::now();
     let deadline = timeout_s
         .map(|s| boot_start + Duration::from_secs(s));
@@ -646,34 +643,6 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     println!("   boot timing: preflight {:.1}s, guest boot {:.1}s, total {:.1}s to ssh-ready",
         preflight, guest_boot, preflight + guest_boot);
 
-    // Agent mode: start the tmux session 'agent' over ssh. The ssh
-    // session context CAN read the virtiofs /workspace (SELinux
-    // virtiofs_t is denied to the systemd context — a systemd timer
-    // cannot trigger on /workspace/prompt.txt), so the supervisor does
-    // it. ssh-ready implies the /workspace mount is up (the baked
-    // pi-vm-net unit runs Before=sshd and mounts it first).
-    if agent_mode && !shell {
-        let start_cmd = "tmux has-session -t agent 2>/dev/null || tmux new-session -d -s agent -f /dev/null \"tmux set status off; PI_VM_SERVICE=1 /usr/local/bin/pi-vm-launch.sh\"";
-        let mut started = false;
-        for _ in 0..3 {
-            let o = Command::new("ssh")
-                .args(ssh_opts(&key))
-                .arg(format!("root@{}", meta.ip))
-                .arg(start_cmd)
-                .output();
-            if o.map(|o| o.status.success()).unwrap_or(false) {
-                started = true;
-                break;
-            }
-            thread::sleep(Duration::from_secs(10));
-        }
-        if started {
-            println!("   agent session 'agent' started (pi with the prompt)");
-        } else {
-            eprintln!("   WARN: could not start the agent session — the attach fallback runs the launch script directly");
-        }
-    }
-
     // --- attach or foreground-wait ---
     // `attach_failed`: the attach ssh session did not run normally (spawn
     // failed, wait failed, or ssh exited with 255 — a transport/auth
@@ -698,17 +667,10 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
             .arg(&target);
         // Drop into /workspace (baked into the image, so `cd` always works —
         // before virtiofs has mounted it's an empty dir, and the files
-        // appear in the cwd when the mount lands). Default: the agent.
-        // --shell: a plain interactive shell. Exiting the shell (or the
-        // agent, then the shell) stops the VM.
-        // Agent VMs: attach to the timer-launched tmux session 'agent'
-        // (the same session `pi-vm send` types into); if the session is
-        // not up after ~20 s (tmux missing, timer race), run the launch
-        // script directly — the user still gets pi, just without send.
+        // appear in the cwd when the mount lands). Default: pi.
+        // --shell: a plain interactive shell. Exiting the session stops the VM.
         let attach_cmd = if shell {
             "cd /workspace; bash"
-        } else if agent_mode {
-            "cd /workspace; for i in $(seq 1 20); do tmux has-session -t agent 2>/dev/null && break; sleep 1; done; if tmux has-session -t agent 2>/dev/null; then tmux attach -t agent; else /usr/local/bin/pi-vm-launch.sh; fi"
         } else {
             "cd /workspace; pi"
         };
@@ -771,8 +733,8 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
                         }
                         libc_kill(ssh.id(), 15);
                     }
-                    // Guest-initiated stop (an agent VM finishing, or the
-                    // user ran `poweroff` in the guest): sshd dies a few
+                    // Guest-initiated stop (the user ran `poweroff` in
+                    // the guest): sshd dies a few
                     // seconds BEFORE CH exits, and a live ssh client then
                     // hangs on the dead connection for the full TCP
                     // retransmit timeout (~15 min). Kill it as soon as CH
@@ -1129,8 +1091,8 @@ pub fn libc_kill(pid: u32, sig: i32) {
 pub fn libc_kill(_pid: u32, _sig: i32) {}
 
 /// ssh options for talking to a VM's guest — the single source of truth
-/// for every ssh connection this tool makes (boot probe, agent-session
-/// start, attach, graceful poweroff, `pi-vm attach`, `pi-vm send`): the
+/// for every ssh connection this tool makes (boot probe, attach,
+/// graceful poweroff, `pi-vm attach`): the
 /// per-vm key, no host-key checking (the key and host are pi-vm's own),
 /// BatchMode (so an interactive prompt can never hang the supervisor),
 /// and a bounded connection. The caller appends `[-t] root@<ip> <remote

@@ -29,16 +29,9 @@ pub struct Create {
     /// Squash all guest uids to this host uid (default: owner of the project dir)
     #[arg(long)]
     pub squash_uid: Option<u32>,
-    /// Attach to a plain shell in /workspace instead of starting the agent
+    /// Attach to a plain shell in /workspace instead of starting pi
     #[arg(long)]
     pub shell: bool,
-    /// Agent prompt (host path): copied into <project>/prompt.txt — the
-    /// pi-vm supervisor starts pi in a tmux session 'agent' with that
-    /// file as its first message (pi stays interactive, so `pi-vm send`
-    /// can steer it). Requires a shared project (a --no-mount VM has no
-    /// /workspace for the prompt).
-    #[arg(long)]
-    pub prompt_file: Option<String>,
     /// Stop the VM N seconds after launch (boot time counts against it —
     /// pass a budget with a boot buffer)
     #[arg(long)]
@@ -62,9 +55,8 @@ impl Create {
             (Some(p), false) => Some(p.clone()),
             _ => None,
         };
-        // Validate --kvm BEFORE writing prompt.txt below: an early return
-        // here must not leave our copy behind (the rollback in the
-        // create_vm error branch does not cover these paths).
+        // Validate --kvm before any side effects (the create_vm error
+        // branch only rolls back what create_vm itself created).
         let kvm = match self.kvm.as_str() {
             "on" => true,
             "off" => false,
@@ -72,44 +64,6 @@ impl Create {
                 eprintln!("error: --kvm must be 'on' or 'off'");
                 return 2;
             }
-        };
-        // Agent mode: the prompt must end up in the shared folder (the
-        // guest reads /workspace/prompt.txt — no ISO delivery involved).
-        // The flag copies it; a hand-placed <project>/prompt.txt also
-        // makes the VM an agent VM (the supervisor triggers on presence).
-        let mut wrote_prompt = false;
-        let agent_mode = match &self.prompt_file {
-            Some(pf) => match &project {
-                Some(p) => {
-                    let content = std::fs::read_to_string(pf).unwrap_or_else(|e| {
-                        eprintln!("error: cannot read prompt file {pf}: {e}");
-                        std::process::exit(2);
-                    });
-                    let dest = std::path::Path::new(p).join("prompt.txt");
-                    // Remember whether the file pre-existed: a failed
-                    // create must not leave our copy behind (prompt.txt
-                    // presence is the agent-mode trigger — a leftover
-                    // would silently make the *next* create an agent VM),
-                    // but it must not delete a user-placed one either.
-                    let pre_existing = dest.exists();
-                    std::fs::write(&dest, content)
-                        .unwrap_or_else(|e| {
-                            eprintln!("error: cannot write {p}/prompt.txt: {e}");
-                            std::process::exit(2);
-                        });
-                    if !pre_existing {
-                        wrote_prompt = true;
-                    }
-                    true
-                }
-                None => {
-                    eprintln!("error: --prompt-file requires a shared project (the prompt lands in <project>/prompt.txt; a --no-mount VM has no /workspace)");
-                    return 2;
-                }
-            },
-            None => project.as_ref()
-                .map(|p| std::path::Path::new(p).join("prompt.txt").exists())
-                .unwrap_or(false),
         };
         let cfg = VmConfig {
             project,
@@ -125,20 +79,11 @@ impl Create {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("error: {e}");
-                if wrote_prompt {
-                    // roll back the prompt we just wrote — a failed
-                    // create must not turn the next create into an agent
-                    // VM (see above); a user-placed prompt.txt is kept.
-                    let _ = std::fs::remove_file(
-                        std::path::Path::new(&cfg.project.clone().unwrap()).join("prompt.txt"),
-                    );
-                    println!("rolled back the written prompt.txt (the create failed)");
-                }
                 return 2;
             }
         };
         let rm_meta = meta.clone(); // for the --rm auto-delete after boot
-        match boot(home, meta, attach, self.shell, agent_mode, self.timeout, self.rm) {
+        match boot(home, meta, attach, self.shell, self.timeout, self.rm) {
             Ok(code) => {
                 if self.rm {
                     // Only a normal stop reaches here (attach session
