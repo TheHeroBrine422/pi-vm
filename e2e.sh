@@ -20,6 +20,10 @@ ip_of() { $BIN ls | awk -v n="$1" '$NF == n { print $3; exit }'; }
 state_of() { $BIN ls | awk -v n="$1" '$NF == n { print $2; exit }'; }
 sshg() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=10 "root@$1" "$2" 2>/dev/null; }
 wait_timing() { local f=$1 t=${2:-240} i=0; while [ $i -lt $t ]; do grep -q "boot timing" "$f" 2>/dev/null && return 0; sleep 3; i=$((i + 3)); done; return 1; }
+save_console() { # $1 = VM name — preserve its console before fail()'s cleanup
+  local id; id=$($BIN ls | awk -v n="$1" '$NF == n { print $1; exit }')
+  [ -n "$id" ] && [ -f "/root/.local/share/pi-vm/vms/$id/console.log" ] && cp "/root/.local/share/pi-vm/vms/$id/console.log" "$S/$1-console.log"
+}
 wait_state() { local id=$1 want=$2 t=${3:-300} i=0; while [ $i -lt $t ]; do [ "$(state_of "$id")" = "$want" ] && return 0; sleep 3; i=$((i + 3)); done; return 1; }
 pty() { timeout 20 ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes "root@$1" "echo $2" </dev/null 2>/dev/null | grep -q "$2"; }
 
@@ -31,7 +35,7 @@ $BIN rm --force B > /dev/null 2>&1
 $BIN rm --force C > /dev/null 2>&1
 mkdir -p "$S/a" "$S/b" "$S/c"
 nohup $BIN create "$S/a" --name A --timeout 120 > "$S/a.log" 2>&1 &
-wait_timing "$S/a.log" || fail "A create: $(grep -E 'error' "$S/a.log" | head -1)"
+wait_timing "$S/a.log" || { save_console A; fail "A create: $(grep -E 'error' "$S/a.log" | head -1)"; }
 grep "boot timing" "$S/a.log"
 IPA=$(ip_of A); [ -n "$IPA" ] || fail "A has no IP"
 [ "$(state_of A)" = "running" ] || fail "A not running after ready (state=$(state_of A))"
@@ -41,7 +45,7 @@ sshg "$IPA" 'curl -sI -m 8 https://example.com | head -1' | grep -q "HTTP/2 200"
 
 # --- 2. create B (parallel) + isolation ---
 nohup $BIN create "$S/b" --name B --timeout 120 > "$S/b.log" 2>&1 &
-wait_timing "$S/b.log" || fail "B create: $(grep -E 'error' "$S/b.log" | head -1)"
+wait_timing "$S/b.log" || { save_console B; fail "B create: $(grep -E 'error' "$S/b.log" | head -1)"; }
 grep "boot timing" "$S/b.log"
 IPB=$(ip_of B); [ -n "$IPB" ] || fail "B has no IP"
 [ "$IPA" != "$IPB" ] || fail "A and B got the same IP"
@@ -52,7 +56,7 @@ sshg "$IPA" 'curl -sI -m 8 https://example.com | head -1' | grep -q "HTTP/2 200"
 # --- 3. resume A (after its 40 s stop) ---
 wait_state A stopped || fail "A did not stop"
 nohup $BIN resume A --timeout 120 > "$S/a2.log" 2>&1 &
-wait_timing "$S/a2.log" || fail "A resume: $(grep -E 'error' "$S/a2.log" | head -1)"
+wait_timing "$S/a2.log" || { save_console A; fail "A resume: $(grep -E 'error' "$S/a2.log" | head -1)"; }
 grep "boot timing" "$S/a2.log"
 [ "$(sshg "$IPA" 'echo P3')" = "P3" ] || fail "A resume ssh"
 pty "$IPA" P3-PTY || fail "A resume pty"
@@ -61,7 +65,7 @@ sshg "$IPA" 'curl -sI -m 8 https://example.com | head -1' | grep -q "HTTP/2 200"
 # --- 4. resume B ---
 wait_state B stopped || fail "B did not stop"
 nohup $BIN resume B --timeout 120 > "$S/b2.log" 2>&1 &
-wait_timing "$S/b2.log" || fail "B resume: $(grep -E 'error' "$S/b2.log" | head -1)"
+wait_timing "$S/b2.log" || { save_console B; fail "B resume: $(grep -E 'error' "$S/b2.log" | head -1)"; }
 grep "boot timing" "$S/b2.log"
 [ "$(sshg "$IPB" 'echo P4')" = "P4" ] || fail "B resume ssh"
 sshg "$IPB" "ping -c3 -W2 $IPA" | grep -q "0 received" || fail "isolation(resume): B reached A"
@@ -69,7 +73,7 @@ sshg "$IPB" "ping -c3 -W2 $IPA" | grep -q "0 received" || fail "isolation(resume
 # --- 4b. create C --disk 40: the shrink path (the baked fs is pre-grown to
 # 100 G; a 40 G VM must have its fs shrunk to fit by pi-vm-net) ---
 nohup $BIN create "$S/c" --name C --disk 40 --timeout 120 > "$S/c.log" 2>&1 &
-wait_timing "$S/c.log" || fail "C create: $(grep -E 'error' "$S/c.log" | head -1)"
+wait_timing "$S/c.log" || { save_console C; fail "C create: $(grep -E 'error' "$S/c.log" | head -1)"; }
 grep "boot timing" "$S/c.log"
 IPC=$(ip_of C); [ -n "$IPC" ] || fail "C has no IP"
 FS=$(sshg "$IPC" 'df -B1 --output=size / | awk "NR==2{print \$1}"')

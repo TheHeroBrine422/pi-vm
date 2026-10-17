@@ -36,6 +36,8 @@ const PREP_VM_IP: &str = "172.16.254.2";
 const PREP_BR: &str = "br-pi-bake";
 const PREP_TAP: &str = "tap-pi-bake";
 const PREP_MAC: &str = "52:54:00:00:00:2a";
+/// The grow boot's static prep-bridge IP (config disk; no ISO/runcmd needed).
+const PREP_GROW_IP: &str = "172.16.254.10";
 
 #[derive(Args)]
 pub struct Bake {
@@ -393,6 +395,11 @@ impl Bake {
             eprintln!("error: {e}");
             return 3;
         }
+        // Pre-grow the base to 100 G (the user's max usage) so the common
+        // 100 G create skips the first-boot grow (~2.5 s of pi-vm-net).
+        // Soft-fail: any failure keeps the base at its old size and the
+        // first-boot grow still works (slower creates, correct result).
+        self.grow_boot(home, &part);
         if let Err(e) = std::fs::rename(&part, &prepped) {
             eprintln!("error: rename {} -> {}: {e}", part.display(), prepped.display());
             return 1;
@@ -421,6 +428,116 @@ impl Bake {
         println!();
         println!("bake complete. next:");
         println!("  pi-vm create <your-project-dir>");
+        0
+    }
+
+    /// The grow boot: resize the .part to 100 G, then a short second prep
+    /// boot — direct kernel boot + a config disk (static prep-bridge IP;
+    /// no ISO, no runcmd: the baked pi-vm-net converges the network and
+    /// runs the grow) — verify the root fs is ~100 G over ssh, power off.
+    /// Soft-fail only (WARN): the base keeps its old size and the
+    /// first-boot grow still works.
+    fn grow_boot(&self, home: &VmHome, part: &std::path::Path) -> i32 {
+        println!("==> pre-growing the base to 100 G (short 2nd prep boot)");
+        if let Err(e) = run("qemu-img", &["resize", "--shrink", part.to_str().unwrap(), "100G"]) {
+            eprintln!("   WARN: resize to 100G failed: {e} — the base keeps its old size (first-boot grow still works)");
+            return 0;
+        }
+        // Config disk for the prep VM (plain read — no mount).
+        let prep_dir = home.root.join("prep");
+        let cfg = prep_dir.join("grow-config.raw");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&cfg).expect("create grow-config.raw");
+            f.write_all(format!("vm-ip={PREP_GROW_IP}\nvm-gw={PREP_HOST_IP}\nvm-mac={PREP_MAC}\ninstance-id=pi-bake-grow\n").as_bytes()).ok();
+            let _ = f.set_len(1 << 20);
+        }
+        let console = prep_dir.join("grow-console.log");
+        let api_sock = prep_dir.join("grow-api.sock");
+        let _ = std::fs::remove_file(&api_sock);
+        let ch = home.ch_binary();
+        let mut ch_args: Vec<String> = vec![
+            "--api-socket".into(), format!("path={}", api_sock.display()),
+            "--cpus".into(), "boot=2".into(),
+            "--memory".into(), "size=4096M".into(),
+        ];
+        ch_args.extend(crate::vm::direct_boot_args(home).expect("direct_boot_args checked above"));
+        ch_args.extend([
+            "--disk".into(), format!("path={},image_type=qcow2", part.display()),
+            "--disk".into(), format!("path={},image_type=raw,readonly=on", cfg.display()),
+            "--net".into(), format!("tap={PREP_TAP},mac={PREP_MAC}"),
+            "--console".into(), format!("file={}", console.display()),
+        ]);
+        let mut ch = match Command::new(&ch)
+            .args(&ch_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("   WARN: grow boot: spawn CH: {e} — the base keeps its old size");
+                return 0;
+            }
+        };
+        // Wait for ssh (the baked key) — the network converges in ~10-15 s;
+        // then verify the root fs size BEFORE powering off.
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut verified = false;
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_secs(1));
+            if ch.try_wait().ok().flatten().is_some() { break; }
+            if crate::vm::tcp_open(PREP_GROW_IP, 22)
+                && Command::new("ssh")
+                    .args(crate::vm::ssh_opts())
+                    .arg(format!("root@{PREP_GROW_IP}"))
+                    .arg("true")
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            {
+                let size = Command::new("ssh")
+                    .args(crate::vm::ssh_opts())
+                    .arg(format!("root@{PREP_GROW_IP}"))
+                    .args(["df", "-B1", "--output=size", "/"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).lines().nth(1).unwrap_or("").trim().to_string())
+                    .unwrap_or_default();
+                let gb = size.parse::<u64>().map(|b| b / (1000 * 1000 * 1000)).unwrap_or(0);
+                if gb >= 95 {
+                    println!("   root fs at {size} B (~{gb} GB) — pre-grow verified");
+                    verified = true;
+                    let _ = Command::new("ssh")
+                        .args(crate::vm::ssh_opts())
+                        .arg(format!("root@{PREP_GROW_IP}"))
+                        .arg("sync && systemctl poweroff")
+                        .output();
+                } else {
+                    eprintln!("   WARN: grow boot: root fs only {size} B (expected ~100 GB) — the base keeps its old size");
+                }
+                break;
+            }
+        }
+        // Wait for the poweroff (60 s), then the CH API, then kill.
+        let w = Instant::now() + Duration::from_secs(60);
+        while ch.try_wait().ok().flatten().is_none() && Instant::now() < w {
+            thread::sleep(Duration::from_secs(1));
+        }
+        if ch.try_wait().ok().flatten().is_none() {
+            if api_shutdown(&api_sock) {
+                let w2 = Instant::now() + Duration::from_secs(30);
+                while ch.try_wait().ok().flatten().is_none() && Instant::now() < w2 {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+            let _ = ch.kill();
+        }
+        let _ = ch.wait();
+        if !verified {
+            eprintln!("   WARN: grow boot did not verify the 100 G root fs — the base keeps its old size (first-boot grow still works)");
+        }
+        let _ = std::fs::remove_file(&cfg);
         0
     }
 
@@ -777,6 +894,37 @@ for i in $(seq 1 60); do
           fi
           rmdir /var/lock/pi-vm-grow
         } || true
+      fi
+      # The baked fs is pre-grown to 100 G: for a VM whose disk is
+      # smaller, shrink the fs to fit (btrfs online shrink; a fresh VM
+      # uses only a few GB, so it is safe down to single-digit-GB
+      # disks — smaller than that the shrink fails loudly and the fs
+      # stays oversized). growpart cannot shrink the partition; the
+      # oversized partition table is harmless (the kernel caps it at
+      # the device size).
+      if grep -q " / btrfs " /proc/mounts 2>/dev/null; then
+        FSZ=$(df -B1 --output=size / 2>/dev/null | awk 'NR==2{print $1}')
+        if [ -n "$FSZ" ] && [ "$FSZ" -gt "$DS" ] 2>/dev/null; then
+          mkdir /var/lock/pi-vm-grow 2>/dev/null && {
+            btrfs filesystem resize "$((DS / 1073741824))G" / 2>&1 | tail -1
+            rmdir /var/lock/pi-vm-grow
+          } || true
+        fi
+      fi
+      # The requested size (config disk): a VM smaller than the baked fs
+      # keeps the base's virtual disk size (a host-side shrink would make
+      # the root unmountable), so shrink the fs here, while it is still
+      # mountable (btrfs online shrink; a fresh VM uses only a few GB,
+      # so it is safe down to single-digit-GB targets).
+      TGT=$(head -c 4096 /dev/vdb 2>/dev/null | tr -d '\0' | grep "^vm-disk-gb=" | cut -d= -f2)
+      if grep -q " / btrfs " /proc/mounts 2>/dev/null && [ -n "$TGT" ]; then
+        FSZ=$(df -B1 --output=size / 2>/dev/null | awk 'NR==2{print $1}')
+        if [ -n "$FSZ" ] && [ "$FSZ" -gt $((TGT * 1073741824)) ] 2>/dev/null; then
+          mkdir /var/lock/pi-vm-grow 2>/dev/null && {
+            btrfs filesystem resize "${TGT}G" / 2>&1 | tail -1
+            rmdir /var/lock/pi-vm-grow
+          } || true
+        fi
       fi
       grow_done=1
     fi

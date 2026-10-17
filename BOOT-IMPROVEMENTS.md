@@ -65,6 +65,27 @@ the docker number.
   one shared disk. The e2e gate now budgets 120 s per boot (the "budget
   with a boot buffer" semantics); solo numbers are unaffected. Faster guest
   boots (the known-opts below) directly improve the contention case too.
+- 2026-10-17 **host-performance drift caveat**: this 4-vCPU host's boot
+  times drift ±30% over hours (kernel 4.2→5.5 s, zram 0.5→3.7 s, all
+  units scaling together = outer CPU/IO contention, not a code change).
+  All before/after comparisons below use same-window (ideally
+  interleaved) medians, never across-hour absolutes.
+- 2026-10-17 **pre-grow the base to 100 G + guest-side fs sizing (user
+  idea, KEPT)**: bake pre-grows the base (resize + short 2nd prep boot
+  running the existing grow, verified over ssh); default `--disk` 80→100.
+  A create smaller than the baked size does NOT shrink the virtual disk
+  (a truncated qcow2 makes the 100 G btrfs unmountable — the initramfs
+  hangs on the root UUID; `qemu-img resize --shrink` surfaced this latent
+  bug — before it, the failed resize aborted create loudly): the VM keeps
+  the base's virtual size (sparse — no storage cost) and pi-vm-net shrinks
+  the fs to the requested size (vm-disk-gb on the config disk) while it
+  is still mountable. Verified: 40 G create → `df /` exactly 40 GiB; 100 G
+  create → no grow work. Interleaved A/B (same window, 3 each): 100 G VM
+  old image (grows 5.26→100 G on first boot) 20.6 s vs new image (no
+  grow) 18.4 s → **−2.2 s on the default create**. The 80 G base itself
+  was neutral (the grow block's btrfs work is ~3 ms — the 108 MB
+  partition-start offset always trips the 100 MB grow threshold, on every
+  base; only the first grow of a real 5.26 G→X G fs costs seconds).
 
 ## Idea queue (user + self; test when reached)
 
@@ -96,3 +117,41 @@ the docker number.
   `btrfs filesystem resize <disk-size>` (btrfs supports online shrink
   when usage allows); grows above 100 GB still work as today.
   Also: default `--disk-gb` becomes 100 (check current default).
+- **Snapshot-restore "warm boot" (user, 2026-10-17 — from production VPS notes)**:
+  the big one. Pre-boot a template VM to ready state (sshd up, userspace
+  done), `vm.snapshot` it, and restore per create:
+  `--restore "source_url=file:///…/snapshot,memory_restore_mode=ondemand,resume=true"`
+  → time-to-ssh ~1–3 s instead of ~15 s. Key points:
+  - **`ondemand` (lazy, userfaultfd) is the make-or-break** — `copy`
+    (eager) loads all memory up front and may not beat a cold boot.
+    Prototype step 1: confirm userfaultfd restore works on this host
+    kernel (6.19 — likely yes; test via the CH API on a test VM).
+  - **pi-vm adaptation** (no machine-type pools like production): hard-lock
+    the DEFAULT cpu/ram (4 vCPU / 8 G) for the snapshot path — a create
+    with off-default `--vcpus/--memory` falls back to cold boot (or a
+    per-size snapshot matrix later). Disk: the snapshot VM runs on the
+    prepped base; a created VM's disk is a copy of that base, so the
+    snapshot's page cache stays valid while the disk is unmodified — once
+    it diverges (user data) we never re-restore (the VM is already
+    running; a stopped diverged VM boots cold).
+  - **Config injection moves post-restore** (the user's own note: the
+    config-disk read can't happen at normal boot anymore): a small agent
+    in the template, whose first action after restore is read
+    vm-ip/vm-gw/vm-mac off the still-attached config disk and re-apply
+    the NIC config (the snapshot carries the template's IP/MAC). The ssh
+    key is the shared baked key — no injection needed (pi-vm's single-key
+    design is easier than the customer-key case). Virtiofs is the tricky
+    part: the snapshot's fs.sock state is stale — the agent re-mounts
+    /workspace (reuse the pi-vm-net mount logic, decoupled).
+  - **Template hygiene**: authorized_keys = just the shared key; no
+    template IP baked anywhere the agent doesn't overwrite; pi-vm-net
+    disabled in the template (replaced by the agent).
+  - Prototype order: (1) userfaultfd ondemand restore works + measure
+    restore→ssh on a test VM, (2) post-restore agent (config disk +
+    virtiofs remount), (3) pi-vm plumbing (snapshot file in the home dir,
+    create path branch, cold fallback). Storage: snapshot file ≈ memory
+    size (8 G default) — fine.
+  - This subsumes most other guest-side wins (kernel/initrd/userspace are
+  skipped) — the remaining relevant ones: the supervisor pre-CH phases +
+  disk prep (the double-buffered disk idea becomes "next VM's disk +
+  snapshot pool").

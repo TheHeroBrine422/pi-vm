@@ -321,6 +321,26 @@ Resume maybe does pi -r
   - sudo improvements to not pause part way through boot (mentioned earlier)
   - fix the qcow refcount thing that might already be fixed
 
+- rm on stopped vm sometimes records as running
+```
+caleb@ultramarine ~/Code via 🐍 v3.14.7 
+❯ pi-vm rm d2b616fc6188 4ac8eac726a5 2ff126d9bd8a d913929010b8 e087b7bf254b
+error: VM d2b616fc6188 is recorded as running (pid Some(684860)) — use --force to kill it first
+[sudo] password for caleb: 
+deleted VM 4ac8eac726a5
+error: VM 2ff126d9bd8a is recorded as running (pid Some(2579999)) — use --force to kill it first
+deleted VM d913929010b8
+error: VM e087b7bf254b is recorded as running (pid Some(1049000)) — use --force to kill it first
+
+
+caleb@ultramarine ~/Code via 🐍 v3.14.7 took 8s 
+❯ pi-vm version                                                                    
+pi-vm 0.1.0
+cloud-hypervisor cloud-hypervisor v53.0
+Migration Protocol Versions: 0
+cloud image sha256 28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f
+pre-baked image sha256 263a01e3fa6fbb4ed9ce92514e1c3b959debeb42f89759f3cc578ef5b0d403de
+```
 ## Data layout
 
 ```

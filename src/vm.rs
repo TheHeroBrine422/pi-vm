@@ -171,13 +171,43 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     let t_disk = std::time::Instant::now();
     run("cp", &[prepped.to_str().unwrap(), disk.to_str().unwrap()])?;
     let t_cp = t_disk.elapsed().as_secs_f64();
-    run("qemu-img", &["resize", &disk.to_string_lossy(), &format!("{}G", meta.disk_gb)])?;
+    // Grow-only host-side resize: shrinking the virtual size below the
+    // baked fs size makes the root unmountable (btrfs metadata
+    // references chunks beyond the truncated disk — the initramfs hangs
+    // on the root UUID). A VM smaller than the baked size keeps the
+    // base's virtual size (sparse — no storage cost) and pi-vm-net
+    // shrinks the fs to the requested size (vm-disk-gb on the config
+    // disk) while it is still mountable.
+    let baked_gb = prepped_virtual_gb(&prepped)?;
+    if meta.disk_gb > baked_gb {
+        run("qemu-img", &["resize", &disk.to_string_lossy(), &format!("{}G", meta.disk_gb)])?;
+    }
     let t_resize = t_disk.elapsed().as_secs_f64() - t_cp;
-    println!("   disk: copy {:.2}s, resize {:.2}s", t_cp, t_resize);
+    println!("   disk: copy {:.2}s, resize {:.2}s (base {}G, requested {}G)", t_cp, t_resize, baked_gb, meta.disk_gb);
 
     println!("   created VM {} {} ({} vcpus, {} MB, {} GB disk)",
         meta.id, meta.name.as_deref().unwrap_or("(no name)"), meta.vcpus, meta.memory_mb, meta.disk_gb);
     Ok(meta)
+}
+
+/// The base image's virtual size in GiB (from `qemu-img info`).
+fn prepped_virtual_gb(prepped: &std::path::PathBuf) -> Result<u32, String> {
+    let out = run("qemu-img", &["info", prepped.to_str().unwrap()])?;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("virtual size:") {
+            // "100 GiB (107374182400 bytes)" — prefer the byte count.
+            if let Some(pos) = rest.rfind(" bytes") {
+                let num = rest[..pos].rsplit(' ').next().unwrap_or("");
+                if let Ok(b) = num.parse::<u64>() {
+                    return Ok((b / 1073741824).max(1) as u32);
+                }
+            }
+            if let Ok(g) = rest.split_whitespace().next().unwrap_or("1").parse::<u32>() {
+                return Ok(g.max(1));
+            }
+        }
+    }
+    Err(format!("qemu-img info {}: no 'virtual size' line", prepped.display()))
 }
 
 /// Owner uid of the project dir (the default squash target).
@@ -1197,8 +1227,8 @@ pub fn allocate_ip(home: &VmHome, pool: &str) -> Result<String, String> {
 pub fn write_config_disk(home: &VmHome, meta: &VmMeta, hn: &HostNet) -> Result<(), String> {
     let path = meta.vm_dir(home).join("config.raw");
     let text = format!(
-        "vm-ip={}\nvm-gw={}\nvm-mac={}\ninstance-id=pi-{}\n",
-        meta.ip, hn.gateway, meta.mac, meta.id
+        "vm-ip={}\nvm-gw={}\nvm-mac={}\ninstance-id=pi-{}\nvm-disk-gb={}\n",
+        meta.ip, hn.gateway, meta.mac, meta.id, meta.disk_gb
     );
     use std::io::Write;
     let mut f = std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
@@ -1305,7 +1335,7 @@ fn api_shutdown(api_sock: &std::path::Path) -> bool {
     }
 }
 
-fn tcp_open(ip: &str, port: u16) -> bool {
+pub fn tcp_open(ip: &str, port: u16) -> bool {
     // connect_timeout is essential: a plain connect() blocks for the OS
     // TCP timeout (~130 s of dropped SYNs) while the guest's network is
     // down, which stalls the whole boot-wait loop.

@@ -21,7 +21,7 @@ pub struct Create {
     pub vcpus: u32,
     #[arg(long, default_value_t = 8192)]
     pub memory: u32,
-    #[arg(long, default_value_t = 80)]
+    #[arg(long, default_value_t = 100)]
     pub disk: u32,
     /// KVM on|off (CH requires KVM; off = no nested)
     #[arg(long, default_value = "on")]
