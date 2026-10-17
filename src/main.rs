@@ -17,7 +17,7 @@ use state::VmHome;
 #[derive(Parser)]
 #[command(
     name = "pi-vm",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_COMMIT")),
     about = "docker-like CLI for the pi VM sandbox",
     long_about = "docker-like CLI for the pi VM sandbox\n\nA bare first positional that is not a subcommand name is treated as `create <path>`: `pi-vm /tmp/proj` = `pi-vm create /tmp/proj`."
 )]

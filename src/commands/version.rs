@@ -4,7 +4,7 @@ use crate::state::VmHome;
 use crate::util::sha256_file;
 
 pub fn run(home: &VmHome) -> i32 {
-    println!("pi-vm {}", env!("CARGO_PKG_VERSION"));
+    println!("pi-vm {}+{}", env!("CARGO_PKG_VERSION"), env!("GIT_COMMIT"));
     let ch = home.ch_binary();
     if ch.exists() {
         if let Ok(o) = std::process::Command::new(&ch).arg("--version").output() {
