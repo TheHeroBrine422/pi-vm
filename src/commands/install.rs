@@ -3,7 +3,7 @@
 //!   1. checks host requirements (virtiofsd, cloud-init, genisoimage,
 //!      iproute, qemu-img, iptables, libguestfs) and prints the exact
 //!      install command for anything missing — the user runs their own
-//!      package manager (per-distro lists are in the README)
+//!      package manager (the package list is in the README)
 //!   2. locates the Cloud Hypervisor binary: $CH_BIN > existing assets
 //!      copy > PATH (e.g. a terrapkg install — symlinked into assets) >
 //!      download of the static v53.0 binary
@@ -23,7 +23,7 @@ pub struct Install {}
 
 impl Install {
     pub fn run(&self, home: &VmHome) -> i32 {
-        let pm = if run_ok("which", &["dnf"]) { Some("dnf") } else if run_ok("which", &["apt-get"]) { Some("apt") } else { None };
+        let pm = if run_ok("which", &["dnf"]) { Some("dnf") } else { None };
         if !self.requirements(pm) {
             eprintln!();
             eprintln!("install incomplete: install the packages above, then re-run `pi-vm install`");
@@ -39,43 +39,41 @@ impl Install {
         0
     }
 
-    /// Host requirements, checked by BINARY name (distro-independent).
-    /// No auto-install: missing packages are reported with the exact command
-    /// for the detected package manager (README has the per-distro lists).
-    /// Returns false (run aborts) when anything is missing.
+    /// Host requirements, checked by BINARY name. No auto-install: missing
+    /// packages are reported with the exact dnf command (README has the
+    /// package list). Returns false (run aborts) when anything is missing.
     fn requirements(&self, pm: Option<&str>) -> bool {
         println!("==> [1/4] host requirements (virtiofsd, cloud-init, genisoimage, iproute, qemu-img, iptables, libguestfs)");
-        // (binary to check, dnf package, apt package, note)
-        let specs: [(&str, &str, &str, &str); 7] = [
-            ("virtiofsd", "virtiofsd", "virtiofsd", ""),
-            ("cloud-init", "cloud-init", "cloud-init", ""),
-            ("genisoimage", "genisoimage", "genisoimage", ""),
-            ("ip", "iproute", "iproute2", ""),
-            ("qemu-img", "qemu-img", "qemu-utils", ""),
-            ("iptables", "iptables", "iptables", ""),
-            ("guestfish", "libguestfs", "libguestfs-tools", " (bake only)"),
+        // (binary to check, dnf package, note)
+        let specs: [(&str, &str, &str); 7] = [
+            ("virtiofsd", "virtiofsd", ""),
+            ("cloud-init", "cloud-init", ""),
+            ("genisoimage", "genisoimage", ""),
+            ("ip", "iproute", ""),
+            ("qemu-img", "qemu-img", ""),
+            ("iptables", "iptables", ""),
+            ("guestfish", "libguestfs", " (bake only)"),
         ];
-        let missing: Vec<(&str, &str, &str, &str)> = specs
+        let missing: Vec<(&str, &str, &str)> = specs
             .iter()
-            .filter(|(bin, _, _, _)| {
+            .filter(|(bin, _, _)| {
                 if *bin == "virtiofsd" {
                     virtiofsd_path().is_none()
                 } else {
                     !run_ok("which", &[*bin])
                 }
             })
-            .map(|s| (s.0, s.1, s.2, s.3))
+            .map(|s| (s.0, s.1, s.2))
             .collect();
         if missing.is_empty() {
             println!("   all host requirements present");
             return true;
         }
-        println!("   missing: {}", missing.iter().map(|m| format!("{}{}", m.0, m.3)).collect::<Vec<_>>().join(", "));
+        println!("   missing: {}", missing.iter().map(|m| format!("{}{}", m.0, m.2)).collect::<Vec<_>>().join(", "));
         match pm {
             Some("dnf") => println!("   install with:  dnf install -y {}", missing.iter().map(|m| m.1).collect::<Vec<_>>().join(" ")),
-            Some("apt") => println!("   install with:  apt-get install -y {}", missing.iter().map(|m| m.2).collect::<Vec<_>>().join(" ")),
-            None => println!("   (no dnf/apt-get detected — install the missing binaries with your package manager of choice)"),
-            Some(other) => println!("   (detected {other} but it is not dnf/apt — install the missing binaries with your package manager of choice)"),
+            None => println!("   (dnf not detected — install the missing binaries with your package manager of choice)"),
+            Some(other) => println!("   (detected {other} but it is not dnf — install the missing binaries with your package manager of choice)"),
         }
         false
     }
