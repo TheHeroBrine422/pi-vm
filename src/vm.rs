@@ -84,6 +84,23 @@ pub struct VmConfig {
 }
 
 /// Create a new VM: id, meta, ssh key, disk copy + resize.
+/// The TAP name a snapshot restore expects: CH re-opens the tap named in
+/// the snapshot's config.json (the template's tap — not the adopter's
+/// fresh one), so the host must prepare that exact name.
+fn snapshot_tap_name(home: &VmHome) -> String {
+    let path = home.snapshot_dir("default").join("config.json");
+    if let Ok(text) = std::fs::read_to_string(path)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        for item in v.get("net").and_then(|n| n.as_array()).into_iter().flatten() {
+            if let Some(tap) = item.get("tap").and_then(|t| t.as_str()) {
+                return tap.to_string();
+            }
+        }
+    }
+    format!("tap-{}", &state::WARM_ID[..8])
+}
+
 pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     // preflight
     if let Some(p) = &cfg.project
@@ -137,6 +154,49 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     };
     let now = state::now();
 
+    // Snapshot-pool adoption: a default-spec create (4 vCPU / 8 G /
+    // 100 G — the pi-vm defaults) adopts the bake-time template VM:
+    // its first boot is a CH restore (~1 s to ssh) instead of a cold
+    // boot. The template's (IP, MAC) are fixed (the snapshot bakes
+    // them in), so the adopter reuses them; the adoption overwrites
+    // the template's meta.json in its directory (the pool slot is
+    // single-use — the next bake rebuilds it).
+    if cfg.vcpus == 4 && cfg.memory_mb == 8192 && cfg.disk_gb == 100 {
+        if let Ok(w) = VmMeta::load(home, state::WARM_ID)
+            && w.name.as_deref() == Some("warm-default")
+            && w.state == VmState::Stopped
+        {
+            let meta = VmMeta {
+                id: id.clone(),
+                name: cfg.name.clone(),
+                created: now,
+                updated: now,
+                project: cfg.project.clone(),
+                subnet: pool,
+                ip: w.ip,
+                mac: w.mac,
+                vcpus: cfg.vcpus,
+                memory_mb: cfg.memory_mb,
+                disk_gb: cfg.disk_gb,
+                kvm: cfg.kvm,
+                squash_uid: squash,
+                base_image_sha256,
+                state: VmState::Stopped,
+                ch_pid: None,
+                net_gen: Some(3),
+                snapshot: true,
+                vm_dir_override: Some(state::WARM_ID.to_string()),
+            };
+            // Overwrite the template's meta in its (fixed) directory.
+            meta.save(home)?;
+            println!(
+                "   created VM {} {} (pool adoption — first boot is a snapshot restore)",
+                meta.id,
+                meta.name.as_deref().unwrap_or("(no name)")
+            );
+            return Ok(meta);
+        }
+    }
     let meta = VmMeta {
         id: id.clone(),
         name: cfg.name.clone(),
@@ -159,6 +219,8 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
         state: VmState::Stopped,
         ch_pid: None,
         net_gen: Some(3),
+        snapshot: false,
+        vm_dir_override: None,
     };
     let dir = meta.vm_dir(home);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -386,7 +448,11 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     // Shared bridge serves every VM; this VM gets its own TAP + a static
     // pool IP (written to the config disk by create_vm).
     ensure_shared_network(home).map_err(BootFail::Preflight)?;
-    let tap = meta.tap_name();
+    let tap = if meta.snapshot {
+        snapshot_tap_name(home)
+    } else {
+        meta.tap_name()
+    };
     if !run_ok_priv("ip", &["link", "show", &tap]) {
         run_priv("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
             .map_err(BootFail::Preflight)?;
@@ -529,7 +595,15 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
         ));
     }
     let mut ch_cmd = Command::new(&ch);
-    ch_cmd.args(&ch_args);
+    if meta.snapshot {
+        // Snapshot-pool adoption: a BARE VMM + an API restore (CH 53
+        // diverts to the VmBoot branch when --kernel is passed — the
+        // bare VMM is the only restore path; the snapshot's
+        // config.json carries cpus/memory/devices).
+        ch_cmd.arg("--api-socket").arg(format!("path={}", api_sock.display()));
+    } else {
+        ch_cmd.args(&ch_args);
+    }
     ch_cmd.stdin(Stdio::null());
     ch_cmd.stdout(console_file.try_clone().unwrap());
     ch_cmd.stderr(console_file);
@@ -550,11 +624,50 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     let ch_spawned_at = std::time::Instant::now();
     let t_chspawn = ch_spawned_at.duration_since(boot_start).as_secs_f64();
 
+    // Snapshot-pool adoption: wait for the VMM's API socket, then
+    // restore (OnDemand paging + immediate resume). The VM comes up
+    // mid-run: sshd + the network + (if re-bound before the restore —
+    // the virtiofsd above) /workspace are all already established.
+    let snapshot_restore = meta.snapshot;
+    if snapshot_restore {
+        let sd = std::time::Instant::now() + Duration::from_secs(20);
+        while !api_sock.exists() {
+            if ch_child.try_wait().ok().flatten().is_some() {
+                return Err(BootFail::BootFailed("CH exited before the restore — see console.log".into()));
+            }
+            if std::time::Instant::now() > sd {
+                return Err(BootFail::Preflight("the CH api socket never appeared (restore)".into()));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let snap = home.snapshot_dir("default");
+        let body = format!(
+            "{{\"source_url\":\"file://{}\",\"memory_restore_mode\":\"OnDemand\",\"resume\":true}}",
+            snap.display().to_string().replace('\\', "/")
+        );
+        let (st, resp) = match api_put_unix(&api_sock, "/api/v1/vm.restore", &body) {
+            Ok(r) => r,
+            Err(e) => return Err(BootFail::Preflight(format!("vm.restore call failed: {e}"))),
+        };
+        if st != 204 {
+            return Err(BootFail::Preflight(format!(
+                "vm.restore failed (HTTP {st}): {}",
+                resp.lines().last().unwrap_or("").chars().take(200).collect::<String>()
+            )));
+        }
+        println!("   snapshot restore (ondemand) — the VM resumes mid-run");
+    }
+
     // record running state
     let mut meta = meta;
     meta.state = VmState::Running;
     meta.ch_pid = Some(ch_child.id() as i32);
     meta.updated = state::now();
+    if snapshot_restore {
+        // one-shot: the first boot was the restore; resumes are cold
+        // (the disk has diverged from the template snapshot)
+        meta.snapshot = false;
+    }
     if let Err(e) = meta.save(home) {
         // state save failed — don't orphan the running children
         teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
@@ -600,9 +713,10 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
         if tstp.swap(false, Ordering::Relaxed) {
             eprintln!("{SIGTSTP_HINT}");
         }
-        if ch_child.try_wait().ok().flatten().is_some() {
+        if let Some(status) = ch_child.try_wait().ok().flatten() {
+            let detail = status.code().map(|c| format!("exit {c}")).unwrap_or_else(|| "signalled".to_string());
             teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
-            return Err(BootFail::BootFailed("CH exited during boot — see console.log".into()));
+            return Err(BootFail::BootFailed(format!("CH exited during boot ({detail}) — see console.log")));
         }
         if tcp_open(&meta.ip, 22) {
             let probe = Command::new("ssh")
@@ -1283,6 +1397,46 @@ pub fn ensure_shared_network(home: &VmHome) -> Result<(), String> {
     Ok(())
 }
 
+/// A raw HTTP PUT to the CH REST API over its unix socket (no curl
+/// dependency). Returns (status code, response body). Used for the
+/// snapshot-pool path (vm.snapshot at bake, vm.restore at boot).
+pub fn api_put_unix(socket: &std::path::Path, path: &str, body: &str) -> Result<(u16, String), String> {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| format!("connect {socket:?}: {e}"))?;
+    // CH's actix router does not honor Connection: close — it keeps the
+    // connection open after the response, so read with a timeout and
+    // parse whatever arrives (the status line comes first).
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let req = format!(
+        "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 65536 {
+                    break;
+                }
+            }
+            Err(_) => break, // timeout or closed — use what we have
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Ok((status, text))
+}
+
 /// ssh options for talking to a VM's guest — the single source of truth
 /// for every ssh connection this tool makes (boot probe, attach,
 /// graceful poweroff, `pi-vm attach`): the host user's DEFAULT ssh key
@@ -1421,6 +1575,8 @@ mod tests {
             state: VmState::Stopped,
             ch_pid: None,
             net_gen: Some(2),
+        snapshot: false,
+        vm_dir_override: None,
         }
     }
 

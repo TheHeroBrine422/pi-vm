@@ -55,19 +55,30 @@ pi-vm bake [--pi-dir D] [--ssh-key F] [--timeout N]
                          rebuild the pre-baked base image (pi config +
                          full toolchain + your ssh pubkey + direct-boot
                          kernel assets) — the VM equivalent of a
-                         container image's build-time COPY
+                         container image's build-time COPY. The last
+                         step also snapshots a warm template VM and
+                         leaves it stopped: the next default-spec
+                         create adopts it (see `create`) so its first
+                         boot is a sub-second snapshot restore instead
+                         of a cold boot
                          --ssh-key F: the host pubkey to bake into the
                          image (the guest's root trusts the host user's
                          ssh key; default: ~/.ssh/*.pub, which must
                          resolve to exactly one key)
-pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
+pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 100]
               [--kvm on|off] [--squash-uid U] [--no-mount]
               [--shell] [--timeout N] [--rm]
                          new VM from the pre-baked base (no path, or
                          --no-mount, = no shared mount: no virtiofsd, no
                          /workspace in the guest); boots and (if the
                          terminal is interactive) attaches an ssh session
-                         that starts in pi (cd /workspace; pi)
+                         that starts in pi (cd /workspace; pi).
+                         A default-spec create (4 vCPU / 8 G / 100 G)
+                         adopts the bake-time warm template when the
+                         pool is available: the first boot is a
+                         snapshot restore (a few seconds to ssh instead
+                         of a cold boot); any other spec falls back to
+                         a normal cold boot
                          --timeout N: stop the VM N seconds after launch
                          (boot time counts against it)
                          --rm: when the VM stops normally (the attach
@@ -181,6 +192,22 @@ pi-vm version           CLI + CH versions, image hashes
   Each new VM records the base image's sha256 in meta.json (shown by
   `pi-vm ls -v`), so you can tell whether it is based on the most
   recent bake (compare against `pi-vm version`).
+- **Warm snapshot pool** — the last step of `pi-vm bake` boots a
+  template VM to full readiness, pauses it, and snapshots it
+  (Cloud Hypervisor `vm.snapshot`, on-demand memory mode) before
+  leaving it stopped as the pool. The next default-spec create
+  (4 vCPU / 8 G / 100 G) adopts the pool: instead of a cold boot it
+  restores the snapshot into a fresh CH instance — ssh-ready in a
+  few seconds (the on-demand page-in of the guest's working set
+  dominates; the raw restore itself is sub-second). The template's
+  IP/MAC are fixed (the snapshot bakes them in), so the adopter
+  reuses the pool slot's pair. The pool is single-use per bake:
+  the adopter's meta overwrites the template's, and any other spec
+  (or a missing pool) falls back to a normal cold boot. A resumed
+  adopted VM boots cold from the template's disk (the snapshot is
+  one-shot). The shared mount is re-provisioned on the host side —
+  virtiofs survives the virtiofsd rebind, so no guest-side agent
+  is needed.
 - **Direct kernel boot** — no UEFI, no GRUB: CH loads the kernel +
   initramfs straight from the baked assets (~5–8 s faster than a firmware
   boot). The console is a virtio-console (`hvc0`); `pi-vm logs` shows the

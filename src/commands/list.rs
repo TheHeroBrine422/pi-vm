@@ -287,6 +287,8 @@ mod tests {
             state,
             ch_pid: None,
             net_gen: Some(2),
+            snapshot: false,
+            vm_dir_override: None,
             base_image_sha256: None,
         }
     }

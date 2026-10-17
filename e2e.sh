@@ -14,7 +14,7 @@ set -u
 BIN=${BIN:-/root/.cargo/bin/pi-vm}
 cd "$(dirname "$0")"
 S=$(mktemp -d /tmp/pi-vm-e2e.XXXXXX)
-fail() { echo "GATE-FAIL: $*"; for n in A B C; do $BIN rm --force "$n" > /dev/null 2>&1; done; exit 1; }
+fail() { echo "GATE-FAIL: $*"; for n in B C; do $BIN rm --force "$n" > /dev/null 2>&1; done; exit 1; }
 
 ip_of() { $BIN ls | awk -v n="$1" '$NF == n { print $3; exit }'; }
 state_of() { $BIN ls | awk -v n="$1" '$NF == n { print $2; exit }'; }
@@ -62,6 +62,27 @@ grep "boot timing" "$S/a2.log"
 pty "$IPA" P3-PTY || fail "A resume pty"
 sshg "$IPA" 'curl -sI -m 8 https://example.com | head -1' | grep -q "HTTP/2 200" || fail "A resume internet"
 
+# --- 3b. restore the pool (A consumed it by adoption): the adopter's meta
+# lives in the fixed warm dir; rewrite it back to the template's meta so the
+# NEXT run can adopt again (ip/mac come from the adopter's meta — the pool
+# slot's fixed pair). The snapshot is untouched; the template disk has
+# diverged from the snapshot (documented E2 limitation). Wait for A's final
+# stop first — the running supervisor would otherwise re-save the meta
+# (name A) and the cleanup's `rm A` would delete the warm dir. ---
+if grep -q "pool adoption" "$S/a.log"; then
+  wait_state A stopped || fail "A did not stop before pool restore"
+  python3 - <<'PYEOF' || fail "pool meta restore failed"
+import json, sys
+p = "/root/.local/share/pi-vm/vms/dead00000001/meta.json"
+m = json.load(open(p))
+m["id"] = "dead00000001"; m["name"] = "warm-default"
+m["state"] = "stopped"; m["ch_pid"] = None
+m.pop("snapshot", None); m.pop("vm_dir_override", None)
+json.dump(m, open(p, "w"))
+PYEOF
+  echo "   pool restored for next run"
+fi
+
 # --- 4. resume B ---
 wait_state B stopped || fail "B did not stop"
 nohup $BIN resume B --timeout 120 > "$S/b2.log" 2>&1 &
@@ -80,12 +101,13 @@ FS=$(sshg "$IPC" 'df -B1 --output=size / | awk "NR==2{print \$1}"')
 [ -n "$FS" ] && [ "$FS" -lt 100000000000 ] 2>/dev/null || fail "C fs not shrunk to 40 G (got ${FS:-?} B)"
 [ "$FS" -ge 38000000000 ] 2>/dev/null || fail "C fs shrunk too far (${FS} B < 38 G)"
 
-# --- 5. rm both ---
-$BIN rm --force A > "$S/rmA.log" 2>&1 || fail "rm A: $(grep -E 'error' "$S/rmA.log" | head -1)"
+# --- 5. rm B + C (A is the pool: in the adoption case its meta was restored
+# to warm-default by step 3b, so `rm A` is a name no-op — best effort) ---
+$BIN rm --force A > "$S/rmA.log" 2>&1 || echo "   rm A skipped (pool preserved)"
 $BIN rm --force B > "$S/rmB.log" 2>&1 || fail "rm B: $(grep -E 'error' "$S/rmB.log" | head -1)"
 $BIN rm --force C > "$S/rmC.log" 2>&1 || fail "rm C: $(grep -E 'error' "$S/rmC.log" | head -1)"
 sleep 2
-for n in A B C; do $BIN ls | awk -v n="$n" '$NF == n { found = 1 } END { exit found ? 0 : 1 }' && fail "VM $n remains after rm"; done
+for n in B C; do $BIN ls | awk -v n="$n" '$NF == n { found = 1 } END { exit found ? 0 : 1 }' && fail "VM $n remains after rm"; done
 
 # --- 6. cargo test ---
 cargo test > "$S/test.log" 2>&1 || fail "cargo test failed: $(grep 'test result' "$S/test.log" | head -1)"

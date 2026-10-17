@@ -426,6 +426,12 @@ impl Bake {
                 let _ = std::fs::remove_file(&fixed);
             }
         }
+        // [warm] the snapshot pool: a default-spec template VM is booted
+        // once at bake time; its running-VM snapshot is what future
+        // default-spec creates restore from (first boot ~1 s to ssh).
+        // Soft-fail: any problem leaves the pool absent (all creates
+        // cold — the old behavior).
+        self.warm_snapshot(home);
         println!("   pre-baked base image ready: {}", prepped.display());
         println!();
         println!("bake complete. next:");
@@ -441,6 +447,19 @@ impl Bake {
     /// first-boot grow still works.
     fn grow_boot(&self, home: &VmHome, part: &std::path::Path) -> i32 {
         println!("==> pre-growing the base to 100 G (short 2nd prep boot)");
+        // A FRESH tap: a stale tap-pi-bake from the first prep boot
+        // keeps its old MAC (CH: "IP configuration will not be
+        // overwritten"), and the guest NIC (PREP_MAC) would not match
+        // the config disk's vm-mac — the network would never converge.
+        run_ok_priv("ip", &["link", "del", PREP_TAP]);
+        if !run_ok_priv("ip", &["link", "show", PREP_TAP]) {
+            if let Err(e) = run_priv("ip", &["tuntap", "add", "dev", PREP_TAP, "mode", "tap"]) {
+                eprintln!("   WARN: grow boot: create tap: {e}");
+                return 0;
+            }
+        }
+        run_ok_priv("ip", &["link", "set", PREP_TAP, "master", PREP_BR]);
+        run_ok_priv("ip", &["link", "set", PREP_TAP, "up"]);
         if let Err(e) = run("qemu-img", &["resize", "--shrink", part.to_str().unwrap(), "100G"]) {
             eprintln!("   WARN: resize to 100G failed: {e} — the base keeps its old size (first-boot grow still works)");
             return 0;
@@ -506,8 +525,9 @@ impl Bake {
                     .output()
                     .map(|o| String::from_utf8_lossy(&o.stdout).lines().nth(1).unwrap_or("").trim().to_string())
                     .unwrap_or_default();
+                let console_nonempty = std::fs::metadata(&console).map(|m| m.len() > 1024).unwrap_or(false);
                 let gb = size.parse::<u64>().map(|b| b / (1000 * 1000 * 1000)).unwrap_or(0);
-                if gb >= 95 {
+                if gb >= 95 && console_nonempty {
                     println!("   root fs at {size} B (~{gb} GB) — pre-grow verified");
                     verified = true;
                     let _ = Command::new("ssh")
@@ -545,6 +565,147 @@ impl Bake {
         }
         let _ = std::fs::remove_file(&cfg);
         0
+    }
+
+    /// Build the snapshot pool slot (see the [warm] call in run()):
+    /// a default-spec template VM (4 vCPU / 8 G / 100 G, with a dummy
+    /// project dir so the virtiofs device exists for the adopter's
+    /// rebind), booted cold, snapshotted while running (CH 53's API
+    /// needs no pre-pause), then stopped. The template dir + snapshot
+    /// persist; the first default-spec `create` adopts them. Soft-fail
+    /// throughout: no pool = all cold boots (the old behavior).
+    fn warm_snapshot(&self, home: &VmHome) {
+        println!("==> [warm] snapshot pool (default spec — soft-fail)");
+        let wdir = home.warm_dir();
+        let _ = std::fs::remove_dir_all(&wdir);
+        let _ = std::fs::create_dir_all(&wdir);
+        let dummy = home.root.join("warm-proj");
+        let _ = std::fs::create_dir_all(&dummy);
+        let hn = crate::vm::host_net(home);
+        let now = crate::state::now();
+        let mut meta = crate::state::VmMeta {
+            id: crate::state::WARM_ID.to_string(),
+            name: Some("warm-default".to_string()),
+            created: now, updated: now,
+            project: Some(dummy.to_string_lossy().into_owned()),
+            subnet: hn.pool.clone(),
+            ip: String::new(), mac: crate::state::random_mac(),
+            vcpus: 4, memory_mb: 8192, disk_gb: 100, kvm: true,
+            squash_uid: 0, base_image_sha256: None,
+            state: crate::state::VmState::Stopped, ch_pid: None,
+            net_gen: Some(3),
+        snapshot: false,
+        vm_dir_override: None,
+        };
+        match crate::vm::allocate_ip(home, &hn.pool) {
+            Ok(ip) => meta.ip = ip,
+            Err(e) => { eprintln!("   WARN: warm pool skipped (ip: {e})"); return; }
+        }
+        if meta.save(home).is_err() || crate::vm::write_config_disk(home, &meta, &hn).is_err() {
+            eprintln!("   WARN: warm pool skipped (meta/config write failed)"); return;
+        }
+        // Template disk: a copy of the prepped base (100 G = the
+        // pre-grown size — no resize needed).
+        if run("cp", &[home.prepped_image().to_str().unwrap(), meta.disk_path(home).to_str().unwrap()]).is_err() {
+            eprintln!("   WARN: warm pool skipped (disk copy failed)"); return;
+        }
+        // The snapshot thread: once the template's ssh is reachable, take
+        // a vm.snapshot (the VM stays running; boot() runs it to the
+        // 90 s budget, then stops it).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sock = meta.vm_dir(home).join("ch.sock");
+        let sip = meta.ip.clone();
+        let _ = std::thread::spawn(move || {
+            for _ in 0..180 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if crate::vm::tcp_open(&sip, 22)
+                    && std::process::Command::new("ssh")
+                        .args(crate::vm::ssh_opts())
+                        .arg(format!("root@{sip}"))
+                        .arg("true")
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                {
+                    // CH 53 writes the snapshot into an EXISTING directory;
+                    // a pause attempt first (the prototype snapshot 204ed
+                    // even after a failed pause — ignore the result).
+                    // A FRESH destination dir: a stale file from an
+                    // earlier bake makes the snapshot fail with
+                    // "File exists" (os error 17).
+                    let _ = std::fs::remove_dir_all("/tmp/warm-snap");
+                    let _ = std::fs::create_dir_all("/tmp/warm-snap");
+                    // Retry: the first attempt can hit a transient device
+                    // state right after ssh-ready; the template runs to
+                    // the 90 s budget, so there is time.
+                    let mut ok = false;
+                    for attempt in 0..6 {
+                        let _ = crate::vm::api_put_unix(&sock, "/api/v1/vm.pause", "");
+                        let body = "{\"state\":\"vm\",\"destination_url\":\"file:///tmp/warm-snap\",\"memory_restore_mode\":\"OnDemand\"}";
+                        match crate::vm::api_put_unix(&sock, "/api/v1/vm.snapshot", body) {
+                            Ok((st, resp)) => {
+                                Self::append_data("/tmp/warm-snap-attempts.log", &format!("attempt {attempt}: HTTP {st} {resp}\n"));
+                                if st == 204 { ok = true; break; }
+                            }
+                            Err(e) => {
+                                Self::append_data("/tmp/warm-snap-attempts.log", &format!("attempt {attempt}: {e}\n"));
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                    let _ = tx.send(ok);
+                    return;
+                }
+            }
+            let _ = tx.send(false);
+        });
+        match crate::vm::boot(home, meta, false, false, Some(90), false) {
+            Ok(0) => {}
+            _ => {
+                eprintln!("   WARN: warm template boot failed — no pool (all creates cold)");
+                self.warm_cleanup(home);
+                return;
+            }
+        }
+        if !rx.recv().unwrap_or(false) {
+            eprintln!("   WARN: the template snapshot did not complete (no 204) — no pool (all creates cold)");
+            self.warm_cleanup(home);
+            return;
+        }
+        // Move the snapshot into place (cross-device /tmp -> home: cp).
+        // Copy the CONTENTS (cp -r dir/. dest/): a plain `cp -r dir dest`
+        // nests the directory inside the existing dest.
+        let dest = home.snapshot_dir("default");
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::create_dir_all(&dest);
+        if run("cp", &["-r", "/tmp/warm-snap/.", dest.to_str().unwrap()]).is_err() {
+            eprintln!("   WARN: copying the snapshot failed — no pool");
+            self.warm_cleanup(home);
+            return;
+        }
+        let _ = std::fs::remove_dir_all("/tmp/warm-snap");
+        for f in ["config.json", "memory-ranges", "state.json"] {
+            if !dest.join(f).exists() {
+                eprintln!("   WARN: the snapshot is missing {f} — no pool");
+                self.warm_cleanup(home);
+                return;
+            }
+        }
+        println!("   snapshot pool ready (default spec 4 vCPU / 8 G / 100 G: the next default create adopts it — first boot is a restore)");
+    }
+
+    fn warm_cleanup(&self, home: &VmHome) {
+        let _ = std::fs::remove_dir_all(home.warm_dir());
+        let _ = std::fs::remove_dir_all(home.snapshot_dir("default"));
+        let _ = std::fs::remove_dir_all(home.root.join("warm-proj"));
+    }
+
+    /// Best-effort append a line to a file (diagnostics helper).
+    fn append_data(path: &str, line: &str) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 
     fn resolve_pi_dir(&self) -> Option<PathBuf> {

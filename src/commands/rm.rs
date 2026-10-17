@@ -182,6 +182,8 @@ mod tests {
             state,
             ch_pid,
             net_gen: Some(2),
+        snapshot: false,
+        vm_dir_override: None,
         };
         meta.save(home).unwrap();
     }

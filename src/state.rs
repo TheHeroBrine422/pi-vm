@@ -25,6 +25,9 @@ pub struct VmHome {
     pub root: PathBuf,
 }
 
+/// The snapshot-pool template VM's fixed id (its dir name + tap prefix).
+pub const WARM_ID: &str = "dead00000001";
+
 impl VmHome {
     pub fn new() -> Self {
         let root = std::env::var("PI_VM_HOME").map(PathBuf::from).unwrap_or_else(|_| {
@@ -44,6 +47,17 @@ impl VmHome {
 
     pub fn vms_dir(&self) -> PathBuf {
         self.root.join("vms")
+    }
+
+    /// The snapshot-pool template VM's directory (the bake builds it;
+    /// a default-spec create adopts it, consuming the pool slot).
+    pub fn warm_dir(&self) -> PathBuf {
+        self.vms_dir().join(WARM_ID)
+    }
+
+    /// The snapshot slot files (config.json + memory-ranges + state.json).
+    pub fn snapshot_dir(&self, slot: &str) -> PathBuf {
+        self.root.join("snapshots").join(slot)
     }
 
     pub fn ch_binary(&self) -> PathBuf {
@@ -152,11 +166,25 @@ pub struct VmMeta {
     /// Set while a pi-vm process is supervising this VM (reconciled on load).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ch_pid: Option<i32>,
+    /// One-shot flag: this VM is a snapshot-pool adoption — its FIRST
+    /// boot is a CH restore from the bake-time template snapshot (~1 s
+    /// to ssh instead of a cold boot). Cleared after that first boot
+    /// (resumes are normal cold boots; the disk has diverged).
+    #[serde(default)]
+    pub snapshot: bool,
+    /// Snapshot-pool adoptions live in the template's VM directory
+    /// (the snapshot's config.json bakes those absolute paths in); the
+    /// meta keeps the new id, the dir keeps the template's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_dir_override: Option<String>,
 }
 
 impl VmMeta {
     pub fn vm_dir(&self, home: &VmHome) -> PathBuf {
-        home.vms_dir().join(&self.id)
+        match &self.vm_dir_override {
+            Some(d) => home.vms_dir().join(d),
+            None => home.vms_dir().join(&self.id),
+        }
     }
 
     pub fn disk_path(&self, home: &VmHome) -> PathBuf {
@@ -433,6 +461,8 @@ mod tests {
             state: VmState::Stopped,
             ch_pid: None,
             net_gen: Some(2),
+        snapshot: false,
+        vm_dir_override: None,
         };
         assert!(meta.tap_name().len() <= 15);
         let _ = home;
@@ -461,6 +491,8 @@ mod tests {
             state: VmState::Stopped,
             ch_pid: None,
             net_gen: Some(2),
+        snapshot: false,
+        vm_dir_override: None,
         };
         meta.save(&home).unwrap();
         let loaded = VmMeta::load(&home, &id).unwrap();
@@ -496,6 +528,8 @@ mod tests {
             state: VmState::Stopped,
             ch_pid: None,
             net_gen: Some(2),
+        snapshot: false,
+        vm_dir_override: None,
         };
         meta.save(&home).unwrap();
         // simulate an old meta.json: drop the field from the saved JSON
@@ -550,6 +584,8 @@ mod tests {
             state: VmState::Stopped,
             ch_pid: None,
             net_gen,
+            snapshot: false,
+            vm_dir_override: None,
         };
         assert!(is_legacy_networking(&mk(None))); // old meta.json: no net_gen field
         assert!(is_legacy_networking(&mk(Some(2)))); // the DHCP-era build
@@ -579,6 +615,8 @@ mod tests {
             state: VmState::Stopped,
             ch_pid: None,
             net_gen: Some(2),
+        snapshot: false,
+        vm_dir_override: None,
         };
         meta.save(&home).unwrap();
         assert_eq!(resolve(&home, &id).unwrap().id, id);
@@ -607,6 +645,8 @@ mod tests {
             ch_pid,
             net_gen: Some(2),
             base_image_sha256: None,
+            snapshot: false,
+            vm_dir_override: None,
         }
     }
 
