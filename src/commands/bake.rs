@@ -381,9 +381,18 @@ impl Bake {
         // image remain — still valid, the prep boot doesn't change the
         // kernel).
         extract_boot_assets(&part, home);
-        // Install the cloud-init-independent net + ssh fallback
-        // (best effort: a failure leaves the runcmd as the only path).
-        write_net_fallback(&part, &pubkey);
+        // Settle the writeback before the next guestfish session touches
+        // the same qcow2 (a racing session loses writes — see
+        // write_net_fallback's retry).
+        let _ = std::process::Command::new("sync").output();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        // Install the cloud-init-independent net + ssh fallback + the
+        // baked ssh setup (verified; a failure fails the bake — the
+        // .part is preserved for debugging).
+        if let Err(e) = write_net_fallback(&part, &pubkey) {
+            eprintln!("error: {e}");
+            return 3;
+        }
         if let Err(e) = std::fs::rename(&part, &prepped) {
             eprintln!("error: rename {} -> {}: {e}", part.display(), prepped.display());
             return 1;
@@ -768,68 +777,117 @@ const NET_START_TIMER: &str = "[Unit]\nDescription=Start pi-vm network setup (re
 
 /// Write the net-fallback script + units + the baked ssh setup into the
 /// baked image (one patient guestfish RW session; the -i inspection
-/// mounts the btrfs root subvolume at /sysroot).
-fn write_net_fallback(part: &std::path::Path, pubkey: &str) {
+/// mounts the btrfs root subvolume at /sysroot). The ssh setup runs as
+/// an uploaded SCRIPT (not an inline sh -c — the nested quoting of
+/// `grep "..." ... || echo "..." >>` silently broke the guest shell's
+/// parse, which is how a bake with an EMPTY authorized_keys shipped);
+/// the bake then VERIFIES the key + config actually landed (a failed
+/// verification fails the bake instead of shipping an unusable image).
+fn write_net_fallback(part: &std::path::Path, pubkey: &str) -> Result<(), String> {
     println!("   installing the cloud-init-independent net fallback + ssh setup");
-    let tmp = std::env::temp_dir().join(format!("pi-vm-netfb-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp);
-    let entries: [(&str, &str); 3] = [
-        ("pi-vm-net.sh", NET_SCRIPT),
-        ("pi-vm-net.service", NET_SERVICE),
-        ("pi-vm-net-start.timer", NET_START_TIMER),
-    ];
-    for (name, content) in &entries {
-        if std::fs::write(tmp.join(name), content).is_err() {
-            eprintln!("   (net fallback: temp file write failed — skipped)");
-            return;
+    // Up to two attempts: a "successful" session can still LOSE writes when
+    // the previous session's writeback into the same qcow2 is still
+    // settling (observed: /tmp uploads clobbered while the /usr/local/bin
+    // + /etc uploads landed). Verify after each attempt; settle (sync +
+    // sleep) before the retry.
+    for attempt in 1..=2 {
+        let tmp = std::env::temp_dir().join(format!("pi-vm-netfb-{}-{}", std::process::id(), attempt));
+        let _ = std::fs::create_dir_all(&tmp);
+        let entries: [(&str, &str); 3] = [
+            ("pi-vm-net.sh", NET_SCRIPT),
+            ("pi-vm-net.service", NET_SERVICE),
+            ("pi-vm-net-start.timer", NET_START_TIMER),
+        ];
+        // The ssh setup script (uploaded into the image and run from
+        // there — never through an inline sh -c: the nested quoting of
+        // `grep "..." ... || echo "..." >>` silently broke the guest
+        // shell's parse and shipped an EMPTY authorized_keys).
+        let ssh_setup = "\
+#!/bin/sh
+mkdir -p /root/.ssh
+cat /tmp/.pi-vm-sshpub > /root/.ssh/authorized_keys
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/authorized_keys
+grep -q \"^PermitRootLogin yes\" /etc/ssh/sshd_config || echo \"PermitRootLogin yes\" >> /etc/ssh/sshd_config
+rm -f /tmp/.pi-vm-sshpub /tmp/.pi-vm-sshsetup
+";
+        for (name, content) in &entries {
+            if std::fs::write(tmp.join(name), content).is_err() {
+                eprintln!("   (net fallback: temp file write failed)");
+                return Err("temp file write failed (net fallback not baked)".into());
+            }
+        }
+        // The ssh pubkey + setup script (uploaded into the image — never
+        // through a shell).
+        if std::fs::write(tmp.join("ssh-pubkey"), format!("{pubkey}\n")).is_err()
+            || std::fs::write(tmp.join("pi-vm-sshsetup"), ssh_setup).is_err()
+        {
+            eprintln!("   (ssh setup: temp file write failed)");
+            return Err("temp file write failed (ssh setup not baked)".into());
+        }
+        let mut cmds: Vec<String> = vec![];
+        for (name, _) in &entries {
+            cmds.push(format!("upload {} {}", tmp.join(name).display(),
+                if name.ends_with(".sh") { format!("/usr/local/bin/{}", name) } else { format!("/etc/systemd/system/{}", name) }));
+        }
+        cmds.push(format!("upload {} /tmp/.pi-vm-sshpub", tmp.join("ssh-pubkey").display()));
+        cmds.push(format!("upload {} /tmp/.pi-vm-sshsetup", tmp.join("pi-vm-sshsetup").display()));
+        cmds.push("mkdir-p /etc/systemd/system/multi-user.target.wants".into());
+        cmds.push("mkdir-p /etc/systemd/system/timers.target.wants".into());
+        // Bake /workspace in so the attach's `cd /workspace` always works from
+        // boot — before virtiofs has mounted it's an empty dir, and the files
+        // appear in the cwd when the mount lands (the unit mounts over it).
+        cmds.push("mkdir-p /workspace".into());
+        // guestfish `ln` makes a HARD link (systemd needs a symlink); the
+        // appliance has sh, so do the symlinks + chmod in one sh -c (no
+        // inner quotes — see the ssh-setup note above).
+        cmds.push("command \"sh -c 'rm -f /etc/systemd/system/multi-user.target.wants/pi-vm-net.service /etc/systemd/system/pi-vm-net-late.service /etc/systemd/system/pi-vm-net-late.timer /etc/systemd/system/timers.target.wants/pi-vm-net-late.timer /etc/systemd/system/pi-vm-agent.service /etc/systemd/system/pi-vm-agent-start.timer /etc/systemd/system/timers.target.wants/pi-vm-agent-start.timer; ln -sf /etc/systemd/system/pi-vm-net-start.timer /etc/systemd/system/timers.target.wants/pi-vm-net-start.timer; chmod 755 /usr/local/bin/pi-vm-net.sh'\"".into());
+        cmds.push("command \"sh /tmp/.pi-vm-sshsetup\"".into());
+        // Boot optimizations (persist to the baked image):
+        //  - mask cloud-init's later stages: only the local stage matters
+        //    (runcmd); main regenerates the ssh host keys on EVERY boot
+        //    (breaks known_hosts-based reconnects) and costs ~5 s.
+        //  - disable daemons not needed at boot (all stay installed, start
+        //    on demand): chronyd, auditd, sssd, lvm2-monitor,
+        //    qemu-guest-agent (we're on CH). docker/containerd stay
+        //    enabled (autostart — the runcmd's `systemctl enable --now
+        //    docker` persists; docker.service's Requires= pulls containerd
+        //    in even if its wants symlink were missing). The redundant
+        //    docker.socket wants symlink is still removed (the service
+        //    itself starts at boot, so socket activation adds nothing).
+        cmds.push("command \"sh -c 'for u in cloud-init-main cloud-config cloud-final; do ln -sf /dev/null /etc/systemd/system/$u.service; done; for w in /etc/systemd/system/sockets.target.wants/docker.socket /etc/systemd/system/multi-user.target.wants/chronyd.service /etc/systemd/system/multi-user.target.wants/auditd.service /etc/systemd/system/multi-user.target.wants/audit-rules.service /etc/systemd/system/multi-user.target.wants/sssd.service /etc/systemd/system/multi-user.target.wants/lvm2-monitor.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service; do rm -f $w; done'\"".into());
+        let ok = guestfish_rw(part, &cmds);
+        let _ = std::fs::remove_dir_all(&tmp);
+        if !ok {
+            eprintln!("   (net fallback session failed (attempt {attempt}))");
+        }
+        // Verify what actually landed (both the quoting failure mode and
+        // the writeback-race mode ship an unusable image — never ship
+        // unverified).
+        let vtmp = std::env::temp_dir().join(format!("pi-vm-verify-{}-{}", std::process::id(), attempt));
+        let _ = std::fs::create_dir_all(&vtmp);
+        let d1 = format!("download /root/.ssh/authorized_keys {}", vtmp.join("ak").display());
+        let d2 = format!("download /etc/ssh/sshd_config {}", vtmp.join("cfg").display());
+        let _ = guestfish_out(part, &[d1.as_str(), d2.as_str()]);
+        let ak_ok = std::fs::read_to_string(vtmp.join("ak"))
+            .map(|c| c.contains(&pubkey[..pubkey.len().min(40)]))
+            .unwrap_or(false);
+        let cfg_ok = std::fs::read_to_string(vtmp.join("cfg"))
+            .map(|c| c.lines().any(|l| l.trim() == "PermitRootLogin yes"))
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&vtmp);
+        if ak_ok && cfg_ok {
+            println!("   net fallback + ssh setup installed and verified (pi-vm-net.service + start timer; baked key + PermitRootLogin)");
+            return Ok(());
+        }
+        eprintln!("   (ssh setup verification failed (attempt {attempt}: authorized_keys has the key: {ak_ok}; PermitRootLogin yes: {cfg_ok}){})",
+            if attempt == 1 { " — settling (sync + 5 s) and retrying" } else { "" });
+        if attempt == 1 {
+            let _ = std::process::Command::new("sync").output();
+            std::thread::sleep(std::time::Duration::from_secs(5));
         }
     }
-    // The ssh pubkey (baked — the guest's root trusts the host user's
-    // default key; pi-vm's ssh calls use it without a -i flag).
-    let pub_tmp = tmp.join("ssh-pubkey");
-    if std::fs::write(&pub_tmp, format!("{pubkey}\n")).is_err() {
-        eprintln!("   (ssh setup: temp file write failed — skipped)");
-        return;
-    }
-    let mut cmds: Vec<String> = vec![];
-    for (name, _) in &entries {
-        cmds.push(format!("upload {} {}", tmp.join(name).display(),
-            if name.ends_with(".sh") { format!("/usr/local/bin/{}", name) } else { format!("/etc/systemd/system/{}", name) }));
-    }
-    cmds.push(format!("upload {} /tmp/.pi-vm-sshpub", pub_tmp.display()));
-    cmds.push("mkdir-p /etc/systemd/system/multi-user.target.wants".into());
-    cmds.push("mkdir-p /etc/systemd/system/timers.target.wants".into());
-    // Bake /workspace in so the attach's `cd /workspace` always works from
-    // boot — before virtiofs has mounted it's an empty dir, and the files
-    // appear in the cwd when the mount lands (the unit mounts over it).
-    cmds.push("mkdir-p /workspace".into());
-    // guestfish `ln` makes a HARD link (systemd needs a symlink); the
-    // appliance has sh, so do the symlinks + chmod in one sh -c. The ssh
-    // setup: install the baked key (per-connection, so a re-bake with a
-    // new key overwrites cleanly) + allow root login (the per-VM runcmd
-    // used to do both; now the image is the single source).
-    cmds.push("command \"sh -c 'rm -f /etc/systemd/system/multi-user.target.wants/pi-vm-net.service /etc/systemd/system/pi-vm-net-late.service /etc/systemd/system/pi-vm-net-late.timer /etc/systemd/system/timers.target.wants/pi-vm-net-late.timer /etc/systemd/system/pi-vm-agent.service /etc/systemd/system/pi-vm-agent-start.timer /etc/systemd/system/timers.target.wants/pi-vm-agent-start.timer; ln -sf /etc/systemd/system/pi-vm-net-start.timer /etc/systemd/system/timers.target.wants/pi-vm-net-start.timer; chmod 755 /usr/local/bin/pi-vm-net.sh'\"".into());
-    cmds.push("command \"sh -c 'mkdir -p /root/.ssh; cat /tmp/.pi-vm-sshpub > /root/.ssh/authorized_keys; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; grep -q \"^PermitRootLogin yes\" /etc/ssh/sshd_config || echo \"PermitRootLogin yes\" >> /etc/ssh/sshd_config; rm -f /tmp/.pi-vm-sshpub'\"".into());
-    // Boot optimizations (persist to the baked image):
-    //  - mask cloud-init's later stages: only the local stage matters
-    //    (runcmd); main regenerates the ssh host keys on EVERY boot
-    //    (breaks known_hosts-based reconnects) and costs ~5 s.
-    //  - disable daemons not needed at boot (all stay installed, start
-    //    on demand): chronyd, auditd, sssd, lvm2-monitor,
-    //    qemu-guest-agent (we're on CH). docker/containerd stay
-    //    enabled (autostart — the runcmd's `systemctl enable --now
-    //    docker` persists; docker.service's Requires= pulls containerd
-    //    in even if its wants symlink were missing). The redundant
-    //    docker.socket wants symlink is still removed (the service
-    //    itself starts at boot, so socket activation adds nothing).
-    cmds.push("command \"sh -c 'for u in cloud-init-main cloud-config cloud-final; do ln -sf /dev/null /etc/systemd/system/$u.service; done; for w in /etc/systemd/system/sockets.target.wants/docker.socket /etc/systemd/system/multi-user.target.wants/chronyd.service /etc/systemd/system/multi-user.target.wants/auditd.service /etc/systemd/system/multi-user.target.wants/audit-rules.service /etc/systemd/system/multi-user.target.wants/sssd.service /etc/systemd/system/multi-user.target.wants/lvm2-monitor.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service; do rm -f $w; done'\"".into());
-    let ok = guestfish_rw(part, &cmds);
-    let _ = std::fs::remove_dir_all(&tmp);
-    if ok {
-        println!("   net fallback installed (pi-vm-net.service + start timer; convergence loop)");
-    } else {
-        eprintln!("   (net fallback install failed — the runcmd remains the only path)");
-    }
+    Err("ssh setup verification FAILED (authorized_keys and/or PermitRootLogin missing) — the baked image would not be ssh-reachable; re-run `pi-vm bake`".into())
 }
 
 /// Run guestfish RW commands via stdin (LIBGUESTFS_BACKEND=direct, -i
