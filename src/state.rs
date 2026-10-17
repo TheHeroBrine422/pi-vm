@@ -123,13 +123,17 @@ pub struct VmMeta {
     /// Host path shared into the VM at /workspace (None = --no-mount VM).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    /// e.g. the shared 172.16.0.0/12 pool (legacy VMs record their per-VM
-    /// 172.16.N.0/24 — see is_legacy_networking)
+    /// e.g. the host's VM /24 pool (chosen at install, see host_net;
+    /// legacy VMs record their per-VM 172.16.N.0/24 — the guard below)
     pub subnet: String,
     /// The VM's DHCP lease address (last known; empty until first boot)
     pub ip: String,
-    /// e.g. 52:54:00:00:00:55
+    /// e.g. 52:54:00:aa:bb:cc
     pub mac: String,
+    /// Networking generation (Some(2) = shared-bridge DHCP; old meta.json
+    /// files lack the field and deserialize to None = legacy per-VM /24).
+    #[serde(default)]
+    pub net_gen: Option<u8>,
     pub vcpus: u32,
     pub memory_mb: u32,
     pub disk_gb: u32,
@@ -281,7 +285,7 @@ pub fn resolve(home: &VmHome, arg: &str) -> Result<VmMeta, String> {
 /// old baked pi-vm-net script and cannot boot on the shared-bridge DHCP
 /// network — resume refuses them with a clear message.
 pub fn is_legacy_networking(meta: &VmMeta) -> bool {
-    meta.subnet.starts_with("172.16.") && meta.subnet.ends_with("/24")
+    meta.net_gen.is_none()
 }
 
 /// A random locally-administered MAC (the 52:54:00 OUI block keeps pi-vm
@@ -291,6 +295,15 @@ pub fn is_legacy_networking(meta: &VmMeta) -> bool {
 pub fn random_mac() -> String {
     let b = rand_bytes(3);
     format!("52:54:00:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2])
+}
+
+/// A random index below `len` (the old allocate_subnet's picker, repurposed
+/// for the one-per-host pool choice).
+pub fn rand_below(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    rand_bytes(1)[0] as usize % len
 }
 
 fn rand_bytes(len: usize) -> Vec<u8> {
@@ -417,6 +430,7 @@ mod tests {
             base_image_sha256: None,
             state: VmState::Stopped,
             ch_pid: None,
+            net_gen: Some(2),
         };
         assert!(meta.tap_name().len() <= 15);
         let _ = home;
@@ -444,6 +458,7 @@ mod tests {
             base_image_sha256: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
             state: VmState::Stopped,
             ch_pid: None,
+            net_gen: Some(2),
         };
         meta.save(&home).unwrap();
         let loaded = VmMeta::load(&home, &id).unwrap();
@@ -478,6 +493,7 @@ mod tests {
             base_image_sha256: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
             state: VmState::Stopped,
             ch_pid: None,
+            net_gen: Some(2),
         };
         meta.save(&home).unwrap();
         // simulate an old meta.json: drop the field from the saved JSON
@@ -514,13 +530,13 @@ mod tests {
 
     #[test]
     fn legacy_networking_detection() {
-        let mk = |subnet: &str| VmMeta {
+        let mk = |net_gen: Option<u8>| VmMeta {
             id: new_id(),
             name: None,
             created: 0,
             updated: 0,
             project: None,
-            subnet: subnet.into(),
+            subnet: "172.16.55.0/24".into(),
             ip: String::new(),
             mac: "52:54:00:aa:bb:cc".into(),
             vcpus: 1,
@@ -531,10 +547,10 @@ mod tests {
             base_image_sha256: None,
             state: VmState::Stopped,
             ch_pid: None,
+            net_gen,
         };
-        assert!(is_legacy_networking(&mk("172.16.55.0/24")));
-        assert!(!is_legacy_networking(&mk("172.16.0.0/12")));
-        assert!(!is_legacy_networking(&mk("10.0.0.0/24")));
+        assert!(is_legacy_networking(&mk(None))); // old meta.json: no net_gen field
+        assert!(!is_legacy_networking(&mk(Some(2)))); // shared-bridge DHCP
     }
 
     #[test]
@@ -559,6 +575,7 @@ mod tests {
             base_image_sha256: None,
             state: VmState::Stopped,
             ch_pid: None,
+            net_gen: Some(2),
         };
         meta.save(&home).unwrap();
         assert_eq!(resolve(&home, &id).unwrap().id, id);
@@ -585,6 +602,7 @@ mod tests {
             squash_uid: 1000,
             state,
             ch_pid,
+            net_gen: Some(2),
             base_image_sha256: None,
         }
     }

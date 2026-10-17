@@ -286,6 +286,7 @@ mod tests {
             squash_uid: 1000,
             state,
             ch_pid: None,
+            net_gen: Some(2),
             base_image_sha256: None,
         }
     }

@@ -181,6 +181,7 @@ mod tests {
             base_image_sha256: None,
             state,
             ch_pid,
+            net_gen: Some(2),
         };
         meta.save(home).unwrap();
     }

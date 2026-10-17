@@ -85,7 +85,10 @@ impl Install {
     fn shared_network(&self, home: &VmHome) {
         println!("==> [2/5] shared VM network (br-pi-vm + dnsmasq)");
         match crate::vm::ensure_shared_network(home) {
-            Ok(()) => println!("   bridge + dnsmasq up (pool 172.16.0.0/12; inter-VM traffic is blocked)"),
+            Ok(()) => {
+                let hn = crate::vm::host_net(home);
+                println!("   bridge + dnsmasq up (pool {} — chosen to avoid live host subnets; inter-VM traffic is blocked)", hn.pool)
+            }
             Err(e) => eprintln!("   WARN: shared network setup failed: {e} (the boot path will retry)"),
         }
     }
