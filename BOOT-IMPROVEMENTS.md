@@ -86,6 +86,10 @@ the docker number.
   was neutral (the grow block's btrfs work is ~3 ms — the 108 MB
   partition-start offset always trips the 100 MB grow threshold, on every
   base; only the first grow of a real 5.26 G→X G fs costs seconds).
+- 2026-10-17 **250 ms probe cadence (REVERTED — not measurable)**: 3 gate
+  samples (create 19.0, parallel 18.3, resume 21.0/18.2) vs the 0.5 s
+  build (19.3 / 18.0 / 18.8–19.6) — the 0.25 s quantization saving is
+  inside the ±2 s run-to-run noise. Kept the 500 ms cadence.
 
 ## Idea queue (user + self; test when reached)
 
