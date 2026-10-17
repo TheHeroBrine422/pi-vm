@@ -168,8 +168,12 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     // disk: copy pre-baked base + resize (fs grows on boot via the
     // runcmd / pi-vm-net growpart + btrfs resize — idempotent)
     let disk = meta.disk_path(home);
+    let t_disk = std::time::Instant::now();
     run("cp", &[prepped.to_str().unwrap(), disk.to_str().unwrap()])?;
+    let t_cp = t_disk.elapsed().as_secs_f64();
     run("qemu-img", &["resize", &disk.to_string_lossy(), &format!("{}G", meta.disk_gb)])?;
+    let t_resize = t_disk.elapsed().as_secs_f64() - t_cp;
+    println!("   disk: copy {:.2}s, resize {:.2}s", t_cp, t_resize);
 
     println!("   created VM {} {} ({} vcpus, {} MB, {} GB disk)",
         meta.id, meta.name.as_deref().unwrap_or("(no name)"), meta.vcpus, meta.memory_mb, meta.disk_gb);
@@ -299,6 +303,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     }
     let _lock = state::VmLock::acquire(&meta, home)
         .map_err(BootFail::InUse)?;
+    let t_lock = boot_start.elapsed().as_secs_f64();
 
     // VMs created by an older pi-vm (legacy per-VM /24 + NoCloud ISO, the
     // DHCP-era build, or any other generation): their disks carry an old
@@ -390,6 +395,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
             )));
         }
     }
+    let t_net = boot_start.elapsed().as_secs_f64();
 
     // --- orphan protection ---
     // (1) The children get PR_SET_PDEATHSIG=SIGTERM via pre_exec
@@ -440,6 +446,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
         }
         None => None,
     };
+    let t_vfsd = boot_start.elapsed().as_secs_f64();
 
     // --- CH (background child) ---
     let ch = home.ch_binary();
@@ -500,6 +507,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     };
 
     let ch_spawned_at = std::time::Instant::now();
+    let t_chspawn = ch_spawned_at.duration_since(boot_start).as_secs_f64();
 
     // record running state
     let mut meta = meta;
@@ -582,12 +590,14 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
         return Err(BootFail::SshUnreachable("boot timed out".into()));
     }
 
-    // Log the boot timing (helps diagnose slow boots: preflight = network +
-    // ISO + virtiofsd + CH spawn; guest boot = CH spawn -> ssh-ready).
+    // Log the boot timing (helps diagnose slow boots: the supervisor
+    // phases before CH spawn + the guest side CH spawn -> ssh-ready;
+    // the guest internals — kernel vs userspace — are in console.log +
+    // the guest journal / `systemd-analyze` on the VM).
     let preflight = ch_spawned_at.duration_since(boot_start).as_secs_f64();
     let guest_boot = std::time::Instant::now().duration_since(ch_spawned_at).as_secs_f64();
-    println!("   boot timing: preflight {:.1}s, guest boot {:.1}s, total {:.1}s to ssh-ready",
-        preflight, guest_boot, preflight + guest_boot);
+    println!("   boot timing: [supervisor] lock {:.2}s, net+tap {:.2}s, virtiofsd {:.2}s, ch-spawn {:.2}s | [guest] {:.1}s (ch-spawn -> ssh-ready), total {:.1}s",
+        t_lock, t_net - t_lock, t_vfsd - t_net, t_chspawn - t_vfsd, guest_boot, preflight + guest_boot);
 
     // --- attach or foreground-wait ---
     // `attach_failed`: the attach ssh session did not run normally (spawn
