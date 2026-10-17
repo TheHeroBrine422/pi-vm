@@ -148,20 +148,24 @@ pi-vm version           CLI + CH versions, image hashes
   the invoking user).
 - **Networking** — all VMs share one Linux bridge (`br-pi-vm`, set up
   once by `pi-vm install`): each VM gets its own TAP (a random MAC the
-  host generates), a **DHCP** address from a dedicated dnsmasq on the
-  bridge (pool `172.16.0.0/12` — the CGNAT range, so it can't collide
-  with the public internet or a normal LAN), and internet access via
-  iptables NAT — no host port forwarding. Inter-VM traffic is dropped
-  (one iptables rule; the old per-VM `/24` design gave this by
-  construction, on the shared bridge it is policy). The MAC is the
-  supervisor's lookup key: it polls the dnsmasq lease file for the TAP's
-  MAC, then sshes to the leased IP (the host's default ssh key — baked
-  into the image by `pi-vm bake`). A nested pi-vm (running inside one
-  of these VMs) runs its own bridge + dnsmasq on the SAME pool — every
-  level's addresses are on-link at each level, so no subnet allocation
-  or live-interface collision checks are needed. The bridge/tap is
-  verified before boot; a failure aborts with a clear error instead of
-  burning the ssh timeout.
+  host generates) and a **DHCP** address from a dedicated dnsmasq on the
+  bridge, plus internet access via iptables NAT — no host port
+  forwarding. The VM address space is a single `/24` (gateway .1, pool
+  .100-.254) in the 172.16.2-251 space, **chosen once at install time
+  to not overlap any live host interface** (a fixed `172.16.0.0/12` pool
+  would route into docker0's `172.17.0.0/16`) and persisted in
+  `network.conf`. Inter-VM traffic is blocked by **bridge port isolation**
+  (each TAP is an isolated port — it can reach the host side of the
+  bridge but never other VMs; bridged traffic never touches iptables,
+  so this is the real policy) with an iptables FORWARD DROP as the
+  fallback. The MAC is the supervisor's lookup key: it polls the
+  dnsmasq lease file for the TAP's MAC, then sshes to the leased IP
+  (the host's default ssh key — baked into the image by `pi-vm bake`).
+  A nested pi-vm (running inside one of these VMs) runs its own bridge
+  + dnsmasq in its own chosen `/24`; an explicit route makes the pool
+  reachable at each level, so no per-VM allocation or collision checks
+  are needed. The bridge/tap is verified before boot; a failure aborts
+  with a clear error instead of burning the ssh timeout.
 - **Pre-baked base image** — `pi-vm bake` builds the base image: Fedora 44
   cloud + your pi config + the full toolchain (git, ripgrep, fd, node,
   python3, cargo/rust, uv, docker + compose, dhclient, latest pi +
@@ -323,6 +327,7 @@ Resume maybe does pi -r
   images/            fedora44-cloud.qcow2, fedora44-cloud-prepped.qcow2
   vms/<12-hex-id>/   meta.json, disk.qcow2, console.log, .lock
   dnsmasq.conf / dnsmasq.leases / dnsmasq.pid (the dedicated DHCP server)
+  network.conf     the chosen VM /24 pool + gateway (persists across runs)
 ```
 
 Per-VM folder + meta.json (no database): the folder is the source of truth;

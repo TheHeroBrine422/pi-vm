@@ -14,7 +14,8 @@ network**, put a **destination-hardcoded forwarder** on a machine that
    (SOCKS). The VM can only reach that one endpoint — it can't steer the
    forwarder to other private IPs.
 2. **Bind to the VM-facing interface only.** `bind=<bridge-ip>` (the
-   pi-vm bridge is `172.16.0.1` on `br-pi-vm`), not `0.0.0.0` or a
+   pi-vm bridge IP is the gateway of the host's chosen VM `/24` — see
+   `network.conf` / the `pi-vm install` output), not `0.0.0.0` or a
    public interface — so the forwarder isn't internet-exposed.
 3. **Preserve the hostname (SNI / `Host`).** For TLS services that check
    the SNI or `Host` header, add an `/etc/hosts` entry in the VM mapping
@@ -22,9 +23,10 @@ network**, put a **destination-hardcoded forwarder** on a machine that
    correct name. (For plain HTTP, or a server that ignores `Host`, you
    can point the config at the IP:port directly.)
 4. **Firewall.** If the forwarder's port is blocked on the relay
-   machine, allow it **only from the VM bridge network** (`172.16.0.0/12`
-   — a narrow rule; all pi-vm VMs share one bridge, so the rule covers
-   every VM), or pick a port that's already reachable from the VM.
+   machine, allow it **only from the VM bridge network** (the host's
+   chosen `/24` — a narrow rule; all pi-vm VMs share one bridge, so the
+   rule covers every VM), or pick a port that's already reachable from
+   the VM.
 
 ## Recipe 1 — private-network service (Tailscale / LAN)
 
@@ -32,13 +34,13 @@ A machine on the private network runs a forwarder bound to the interface
 facing the VM:
 
 ```
-sudo socat TCP-LISTEN:443,bind=172.16.0.1,fork,reuseaddr TCP:100.98.228.35:443
+sudo socat TCP-LISTEN:443,bind=<bridge-ip>,fork,reuseaddr TCP:100.98.228.35:443
 ```
 
 Then in the VM, map the hostname to the relay's bridge IP:
 
 ```
-echo "172.16.0.1 example.ts.net" >> /etc/hosts
+echo "<bridge-ip> example.ts.net" >> /etc/hosts
 ```
 
 Point your config at the real hostname (`https://example.ts.net/v1`).
@@ -50,13 +52,13 @@ on the tailnet.
 
 If the relay machine's firewall rejects the forwarder's port (the VM sees
 `No route to host` — an ICMP reject — while other ports give
-`Connection refused`), allow the port **only from the VM bridge network**.
-Scope it to the forwarder's port only, never all traffic.
+`Connection refused`), allow the port **only from the VM bridge network**
+(the host's chosen `/24`). Scope it to the forwarder's port only, never
+all traffic.
 
-**The VM bridge (all pi-vm VMs share one — the only width since the
-shared-bridge networking change):**
+**The VM bridge (all pi-vm VMs share one):**
 
 ```
-sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=172.16.0.0/12 port port=443 protocol=tcp accept'
+sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=<vm-net/24> port port=443 protocol=tcp accept'
 sudo firewall-cmd --reload
 ```
