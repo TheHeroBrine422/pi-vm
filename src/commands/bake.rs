@@ -45,6 +45,11 @@ pub struct Bake {
     /// Prep boot timeout in minutes (default 7)
     #[arg(long, default_value_t = 7)]
     pub timeout: u32,
+    /// Host pubkey to bake into the image (the guest trusts the host
+    /// user's ssh key — `pi-vm` uses the default key, no per-VM keys).
+    /// Default: `~/.ssh/*.pub`, which must resolve to exactly one key.
+    #[arg(long)]
+    pub ssh_key: Option<String>,
 }
 
 /// Scope guard: on ANY exit path, kill CH/listener, remove staging, delete the
@@ -91,6 +96,10 @@ impl Bake {
                 eprintln!("error: no pi config dir found (pass --pi-dir, set PI_VM_PI_DIR, or run from a dir containing pi/)");
                 return 2;
             }
+        };
+        let pubkey = match self.resolve_ssh_pubkey() {
+            Some(p) => p,
+            None => return 2,
         };
         let ch = home.ch_binary();
         let img = home.cloud_image();
@@ -372,9 +381,9 @@ impl Bake {
         // image remain — still valid, the prep boot doesn't change the
         // kernel).
         extract_boot_assets(&part, home);
-        // Install the cloud-init-independent network + ssh fallback
+        // Install the cloud-init-independent net + ssh fallback
         // (best effort: a failure leaves the runcmd as the only path).
-        write_net_fallback(&part);
+        write_net_fallback(&part, &pubkey);
         if let Err(e) = std::fs::rename(&part, &prepped) {
             eprintln!("error: rename {} -> {}: {e}", part.display(), prepped.display());
             return 1;
@@ -422,6 +431,68 @@ impl Bake {
         }
         let cwd_pi = PathBuf::from("pi");
         cwd_pi.is_dir().then_some(cwd_pi)
+    }
+
+    /// The host pubkey to bake into the image: `--ssh-key <file>`, or the
+    /// default `~/.ssh/*.pub` glob — which must resolve to EXACTLY one key
+    /// (zero or several: error, point at --ssh-key). The guest's root
+    /// trusts this key; `pi-vm`'s ssh calls use the host's default key.
+    fn resolve_ssh_pubkey(&self) -> Option<String> {
+        let candidates: Vec<PathBuf> = match &self.ssh_key {
+            Some(p) => vec![PathBuf::from(p)],
+            None => {
+                let home = match std::env::var("HOME") {
+                    Ok(h) => h,
+                    Err(_) => {
+                        eprintln!("error: HOME not set — pass --ssh-key <file>");
+                        return None;
+                    }
+                };
+                let ssh = std::path::Path::new(&home).join(".ssh");
+                match std::fs::read_dir(&ssh) {
+                    Ok(mut d) => d
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|x| x == "pub"))
+                        .collect(),
+                    Err(_) => {
+                        eprintln!("error: cannot read {}/.ssh — pass --ssh-key <file>", home);
+                        return None;
+                    }
+                }
+            }
+        };
+        if candidates.len() != 1 {
+            let n = candidates.len();
+            let list = if candidates.is_empty() {
+                String::from("none")
+            } else {
+                candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ")
+            };
+            eprintln!(
+                "error: expected exactly one ssh public key, found {n} ({list}) — pass --ssh-key <file> to choose one"
+            );
+            return None;
+        }
+        let path = &candidates[0];
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: read {}: {e}", path.display());
+                return None;
+            }
+        };
+        let first = content.lines().next().unwrap_or("");
+        if !first.starts_with("ssh-") && !first.contains(" ssh-") {
+            eprintln!(
+                "error: {} does not look like an ssh public key (first line: {:?})",
+                path.display(),
+                &first[..first.len().min(40)]
+            );
+            return None;
+        }
+        println!("   ssh key: {}", path.display());
+        Some(content.trim().to_string())
     }
 }
 
@@ -516,7 +587,7 @@ fi
         r#"
 exec >> /root/bake-debug.log 2>&1;
 echo "pi-vm baking toolchain...";
-(timeout 300 dnf install -y git curl wget ripgrep fd xz bzip2 tar gzip xfsprogs python3 python3-pip cargo uv which cloud-utils-growpart btrfs-progs 2>&1 | tail -3;
+(timeout 300 dnf install -y git curl wget ripgrep fd xz bzip2 tar gzip xfsprogs python3 python3-pip cargo uv which cloud-utils-growpart btrfs-progs dhclient 2>&1 | tail -3;
  echo "dnf1 rc=${{PIPESTATUS[0]}}") || true;
 (timeout 600 dnf install -y docker docker-compose 2>&1 | tail -2;
  systemctl enable --now docker 2>&1 | tail -1;
@@ -579,26 +650,36 @@ const NET_SCRIPT: &str = r#"#!/bin/sh
 # pi-vm per-boot setup. A SINGLE run with an internal convergence loop:
 # for up to 60 s (1 s apart), each check is a single non-blocking attempt,
 # and the loop reapplies whatever is missing until everything has converged
-# (then it exits early). This gets the VM into the correct state as soon as
-# the underlying devices are ready, and self-heals (e.g. the udev
-# interface-rename race) continuously for a minute. Idempotent — safe to run
-# alongside the runcmd (which does the same network + ssh work).
+# (then it exits early). This gets the VM into the correct state as soon
+# as the underlying devices are ready, and self-heals (e.g. the udev
+# interface-rename race) continuously for a minute. Idempotent.
+#
+# The guest's only per-VM knowledge is its own MAC (set by the host on
+# the TAP); its address comes from the host's dnsmasq on the shared
+# bridge (pi-vm ensure_shared_network). The ssh key + config are baked
+# (pi-vm bake --ssh-key). No cloud-init / NoCloud ISO is involved.
 #
 # The checks:
-#   1. virtiofs mount  -> /workspace (the shared dir; N/A for --no-mount)
-#   3. NoCloud ISO     -> /mnt/nocloud (provides the network + ssh config)
-#   4. network         -> ip/link/route from the ISO's meta-data
-#   5. ssh             -> pubkey from the ISO + sshd running
-#   6. disk grow       -> root partition + btrfs fs fill the resized disk
+#   0. NM/resolved   -> disabled (the interface stays under dhclient's
+#                      manual control — idempotent, already off at bake)
+#   1. virtiofs      -> /workspace (the shared dir; N/A for --no-mount)
+#   2. network       -> a DHCP lease on the virtio NIC (kick dhclient if
+#                      there is no 172.16.x.x address yet)
+#   3. ssh           -> sshd running (key + config baked)
+#   4. disk grow     -> root partition + btrfs fs fill the resized disk
 set -u
-mkdir -p /workspace /mnt/nocloud
+mkdir -p /workspace
 
 # per-item "done" flags (1 = converged or not-applicable)
 vfs_done=0; vfs_fails=0
-iso_done=0
 net_done=0
 ssh_done=0
 grow_done=0
+
+# 0. keep the interface under manual control (cheap no-ops after the
+#    bake disabled both; guards against image drift).
+systemctl disable --now NetworkManager 2>/dev/null || true
+systemctl disable --now systemd-resolved 2>/dev/null || true
 
 for i in $(seq 1 60); do
   # 1. virtiofs. Give up after 15 consecutive failures (assume no device —
@@ -615,67 +696,22 @@ for i in $(seq 1 60); do
     fi
   fi
 
-  # 3. NoCloud ISO. One short attempt per iteration (the loop retries — the
-  #    first virtio-blk read can be slow). vdb is the known seed position;
-  #    fall back to a size-filtered scan (the ISO is small; skip >100 MB).
-  if [ "$iso_done" -eq 0 ]; then
-    if [ -f /mnt/nocloud/meta-data ]; then
-      iso_done=1
-    elif timeout 3 mount -o ro /dev/vdb /mnt/nocloud 2>/dev/null && [ -f /mnt/nocloud/meta-data ]; then
-      iso_done=1
-    else
-      umount /mnt/nocloud 2>/dev/null
-      for d in /sys/block/*; do
-        n=$(basename "$d")
-        case "$n" in loop*|ram*|vdb) continue;; esac
-        [ -b "/dev/$n" ] || continue
-        sz=$(cat "/sys/block/$n/size" 2>/dev/null)
-        [ -n "$sz" ] && [ "$sz" -gt 200000 ] && continue
-        if timeout 3 blkid "/dev/$n" 2>/dev/null | grep -q iso9660; then
-          if timeout 5 mount -o ro "/dev/$n" /mnt/nocloud 2>/dev/null && [ -f /mnt/nocloud/meta-data ]; then
-            iso_done=1
-            break
-          fi
-        fi
-      done
+  # 2. network: a DHCP lease (dhclient also writes /etc/resolv.conf with
+  #    the DNS servers — resolved is off, so that file is the only one).
+  #    dhclient daemonizes and holds the lease; start it when no address
+  #    is up yet (covers the first-boot race where the NIC appears after
+  #    any early start attempt, and a stale state after resume).
+  if [ "$net_done" -eq 0 ]; then
+    if ip -4 addr show 2>/dev/null | grep -q "inet 172\.16\."; then
+      net_done=1
+    elif ! pidof dhclient >/dev/null 2>&1; then
+      dhclient 2>/dev/null || true
     fi
   fi
 
-  # 4. network (only once the ISO is readable). One NIC check per iteration
-  #    (no 30 s wait — the loop retries); the MAC-based lookup also survives
-  #    an interface rename (the MAC is unchanged).
-  if [ "$iso_done" -eq 1 ] && [ "$net_done" -eq 0 ]; then
-    IP=$(grep "^vm-ip:" /mnt/nocloud/meta-data | sed "s/^vm-ip: //")
-    HOST=$(grep "^vm-host:" /mnt/nocloud/meta-data | sed "s/^vm-host: //")
-    MAC=$(grep "^vm-mac:" /mnt/nocloud/meta-data | sed "s/^vm-mac: //")
-    if [ -n "$IP" ]; then
-      IF=$(for x in /sys/class/net/*; do
-        n=$(basename "$x")
-        case "$n" in lo|docker*|br-*|tap-*) ;; *)
-          grep -qi "$MAC" "$x/address" 2>/dev/null && echo "$n";;
-        esac
-      done | head -1)
-      [ -n "$IF" ] || IF=$(ls /sys/class/net 2>/dev/null | grep -vE "^lo$|^docker|^br-|^tap-" | head -1)
-      if [ -n "$IF" ]; then
-        ip addr replace "$IP/24" dev "$IF" 2>/dev/null
-        ip link set "$IF" up 2>/dev/null
-        ip route replace default via "$HOST" 2>/dev/null
-        ip -4 addr show dev "$IF" 2>/dev/null | grep -qF "$IP" && net_done=1
-      fi
-    fi
-  fi
-
-  # 5. ssh (only once the ISO is readable). Install the key (sshd re-reads
-  #    authorized_keys per connection, so no restart is needed) and make sure
+  # 3. ssh: key + config are baked (pi-vm bake --ssh-key); just make sure
   #    sshd is running — without waiting for a slow first-boot start.
-  if [ "$iso_done" -eq 1 ] && [ "$ssh_done" -eq 0 ]; then
-    if [ -f /mnt/nocloud/ssh-pubkey ]; then
-      grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config 2>/dev/null || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
-      mkdir -p /root/.ssh
-      grep -qF "$(cat /mnt/nocloud/ssh-pubkey)" /root/.ssh/authorized_keys 2>/dev/null || cat /mnt/nocloud/ssh-pubkey >> /root/.ssh/authorized_keys
-      chmod 700 /root/.ssh
-      chmod 600 /root/.ssh/authorized_keys
-    fi
+  if [ "$ssh_done" -eq 0 ]; then
     if systemctl is-active --quiet sshd 2>/dev/null; then
       ssh_done=1
     else
@@ -683,13 +719,13 @@ for i in $(seq 1 60); do
     fi
   fi
 
-  # 6. disk grow: the host resized the qcow2 to the requested size at
+  # 4. disk grow: the host resized the qcow2 to the requested size at
   #    create; the root partition + btrfs fs must follow (growpart +
   #    btrfs resize are idempotent — no-op when already at max). The
   #    100 MB threshold skips the aligned no-op case. The mkdir lock
-  #    avoids racing the per-boot runcmd, which runs the same check.
-  #    Only mark done once DS+PS are BOTH valid (the partition node
-  #    can be briefly absent right after boot — retry until it is up).
+  #    avoids racing a concurrent run. Only mark done once DS+PS are
+  #    BOTH valid (the partition node can be briefly absent right after
+    #    boot — retry until it is up).
   if [ "$grow_done" -eq 0 ]; then
     D=vda
     [ -b /dev/$D ] || D=$(ls /sys/block 2>/dev/null | grep -vE "^(loop|ram|zram)" | head -1)
@@ -709,8 +745,9 @@ for i in $(seq 1 60); do
     fi
   fi
 
-  # converged? exit early (a healthy VM breaks at ~iteration 1-2).
-  if [ "$vfs_done" -eq 1 ] && [ "$iso_done" -eq 1 ] && [ "$net_done" -eq 1 ] && [ "$ssh_done" -eq 1 ] && [ "$grow_done" -eq 1 ]; then
+  # converged? exit early (a healthy VM breaks at ~iteration 2-3, once
+  # the DHCP lease lands).
+  if [ "$vfs_done" -eq 1 ] && [ "$net_done" -eq 1 ] && [ "$ssh_done" -eq 1 ] && [ "$grow_done" -eq 1 ]; then
     break
   fi
   sleep 1
@@ -719,7 +756,7 @@ done
 exit 0
 "#;
 
-const NET_SERVICE: &str = "[Unit]\nDescription=pi-vm network and ssh setup from NoCloud ISO\nConditionPathExists=/usr/local/bin/pi-vm-net.sh\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=180\nExecStartPre=-/usr/bin/restorecon /usr/local/bin/pi-vm-net.sh\nExecStartPre=/usr/bin/chcon -t bin_t /usr/local/bin/pi-vm-net.sh\nExecStart=/usr/local/bin/pi-vm-net.sh\n";
+const NET_SERVICE: &str = "[Unit]\nDescription=pi-vm per-boot setup (DHCP + ssh + virtiofs + disk grow on the shared bridge)\nConditionPathExists=/usr/local/bin/pi-vm-net.sh\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=180\nExecStartPre=-/usr/bin/restorecon /usr/local/bin/pi-vm-net.sh\nExecStartPre=/usr/bin/chcon -t bin_t /usr/local/bin/pi-vm-net.sh\nExecStart=/usr/local/bin/pi-vm-net.sh\n";
 
 // Repeating timer + ConditionPathExists (on the service): robust across hosts
 // with NO fixed time guess. The timer ticks every 1 s; the service only runs
@@ -729,11 +766,11 @@ const NET_SERVICE: &str = "[Unit]\nDescription=pi-vm network and ssh setup from 
 // ticks are no-ops. It never blocks multi-user (the timer is passive).
 const NET_START_TIMER: &str = "[Unit]\nDescription=Start pi-vm network setup (repeating until the root fs is up)\n\n[Timer]\nOnBootSec=1s\nOnUnitActiveSec=1s\nUnit=pi-vm-net.service\n\n[Install]\nWantedBy=timers.target\n";
 
-/// Write the net-fallback script + units into the baked image (one
-/// patient guestfish RW session; the -i inspection mounts the btrfs
-/// root subvolume at /sysroot).
-fn write_net_fallback(part: &std::path::Path) {
-    println!("   installing the cloud-init-independent net fallback");
+/// Write the net-fallback script + units + the baked ssh setup into the
+/// baked image (one patient guestfish RW session; the -i inspection
+/// mounts the btrfs root subvolume at /sysroot).
+fn write_net_fallback(part: &std::path::Path, pubkey: &str) {
+    println!("   installing the cloud-init-independent net fallback + ssh setup");
     let tmp = std::env::temp_dir().join(format!("pi-vm-netfb-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let entries: [(&str, &str); 3] = [
@@ -747,11 +784,19 @@ fn write_net_fallback(part: &std::path::Path) {
             return;
         }
     }
+    // The ssh pubkey (baked — the guest's root trusts the host user's
+    // default key; pi-vm's ssh calls use it without a -i flag).
+    let pub_tmp = tmp.join("ssh-pubkey");
+    if std::fs::write(&pub_tmp, format!("{pubkey}\n")).is_err() {
+        eprintln!("   (ssh setup: temp file write failed — skipped)");
+        return;
+    }
     let mut cmds: Vec<String> = vec![];
     for (name, _) in &entries {
         cmds.push(format!("upload {} {}", tmp.join(name).display(),
             if name.ends_with(".sh") { format!("/usr/local/bin/{}", name) } else { format!("/etc/systemd/system/{}", name) }));
     }
+    cmds.push(format!("upload {} /tmp/.pi-vm-sshpub", pub_tmp.display()));
     cmds.push("mkdir-p /etc/systemd/system/multi-user.target.wants".into());
     cmds.push("mkdir-p /etc/systemd/system/timers.target.wants".into());
     // Bake /workspace in so the attach's `cd /workspace` always works from
@@ -759,8 +804,12 @@ fn write_net_fallback(part: &std::path::Path) {
     // appear in the cwd when the mount lands (the unit mounts over it).
     cmds.push("mkdir-p /workspace".into());
     // guestfish `ln` makes a HARD link (systemd needs a symlink); the
-    // appliance has sh, so do the symlinks + chmod in one sh -c.
+    // appliance has sh, so do the symlinks + chmod in one sh -c. The ssh
+    // setup: install the baked key (per-connection, so a re-bake with a
+    // new key overwrites cleanly) + allow root login (the per-VM runcmd
+    // used to do both; now the image is the single source).
     cmds.push("command \"sh -c 'rm -f /etc/systemd/system/multi-user.target.wants/pi-vm-net.service /etc/systemd/system/pi-vm-net-late.service /etc/systemd/system/pi-vm-net-late.timer /etc/systemd/system/timers.target.wants/pi-vm-net-late.timer /etc/systemd/system/pi-vm-agent.service /etc/systemd/system/pi-vm-agent-start.timer /etc/systemd/system/timers.target.wants/pi-vm-agent-start.timer; ln -sf /etc/systemd/system/pi-vm-net-start.timer /etc/systemd/system/timers.target.wants/pi-vm-net-start.timer; chmod 755 /usr/local/bin/pi-vm-net.sh'\"".into());
+    cmds.push("command \"sh -c 'mkdir -p /root/.ssh; cat /tmp/.pi-vm-sshpub > /root/.ssh/authorized_keys; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; grep -q \"^PermitRootLogin yes\" /etc/ssh/sshd_config || echo \"PermitRootLogin yes\" >> /etc/ssh/sshd_config; rm -f /tmp/.pi-vm-sshpub'\"".into());
     // Boot optimizations (persist to the baked image):
     //  - mask cloud-init's later stages: only the local stage matters
     //    (runcmd); main regenerates the ssh host keys on EVERY boot
