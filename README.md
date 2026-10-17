@@ -17,13 +17,12 @@ docs/       forwarding.md (reaching private/remote services from a VM)
 ## Install / Setup
 
 Requirements:
-- a Linux host with KVM (`/dev/kvm`); a dnf-based (Fedora/CachyOS) or
-  apt-based (Ubuntu/Debian) distro is expected for the package list below
+- a Linux host with KVM (`/dev/kvm`); a dnf-based (Fedora/CachyOS)
+  distro is expected for the package list below
 - rust toolchain installed
 - host packages (install once, with your own package manager):
-  - dnf: `dnf install -y virtiofsd cloud-init genisoimage iproute qemu-img iptables libguestfs`
-  - apt: `apt-get install -y virtiofsd cloud-init genisoimage iproute2 qemu-utils iptables libguestfs-tools`
-  - (`libguestfs`/`libguestfs-tools` is only needed for `pi-vm bake`)
+  - `dnf install -y virtiofsd cloud-init genisoimage iproute qemu-img iptables libguestfs`
+  - (`libguestfs` is only needed for `pi-vm bake`)
 - a Cloud Hypervisor binary — `pi-vm install` picks one up from `$CH_BIN`,
   an existing assets copy, or `PATH` (e.g. a terrapkg install); otherwise
   it downloads the static v53.0 build
@@ -58,19 +57,12 @@ pi-vm bake [--pi-dir D] [--timeout N]
                          build-time COPY
 pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
               [--kvm on|off] [--squash-uid U] [--no-mount]
-              [--shell] [--prompt-file F] [--timeout N] [--rm]
+              [--shell] [--timeout N] [--rm]
                          new VM from the pre-baked base (no path, or
                          --no-mount, = no shared mount: no virtiofsd, no
                          /workspace in the guest); boots and (if the
                          terminal is interactive) attaches an ssh session
                          that starts in pi (cd /workspace; pi)
-                         --prompt-file F: F is copied to <path>/prompt.txt
-                         — an AGENT VM: pi-vm starts pi in a tmux
-                         session 'agent' with that file as its first
-                         message (pi stays interactive — steer it with
-                         `pi-vm send`), and the VM powers itself off when
-                         pi exits. A hand-placed <path>/prompt.txt also
-                         makes the VM an agent VM.
                          --timeout N: stop the VM N seconds after launch
                          (boot time counts against it)
                          --rm: when the VM stops normally (the attach
@@ -78,29 +70,16 @@ pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
                          (disk + state + network) instead of leaving it
                          stopped; a failed boot or a failed attach does
                          not delete it
-pi-vm resume <id|name> [--shell] [--prompt-file F]
+pi-vm resume <id|name> [--shell]
            [--timeout N] [--rm]
-                         boot an existing VM and attach; --prompt-file
-                         re-copies the prompt (the disk persists, so a
-                         previous prompt.txt keeps the VM an agent VM);
-                         --rm deletes the VM when it stops normally
-                         (the attach session ends, or --timeout fires)
-                         instead of leaving it stopped
-pi-vm send <id|name> -m MSG
-                         type MSG into the running VM's agent (the tmux
-                         session 'agent' — agent VMs only); a newline in
-                         MSG becomes a space (a pty newline would submit
-                         early)
+                         boot an existing VM and attach; --rm deletes
+                         the VM when it stops normally (the attach
+                         session ends, or --timeout fires) instead of
+                         leaving it stopped
 pi-vm attach <id|name>
                          attach a plain shell to a running VM (not the
                          pi session); the VM keeps running when you exit
                          (the supervisor that booted it owns the VM)
-pi-vm fetch <id|name> <guest-path> <host-path>
-                         copy a file or directory from a running VM to
-                         the host (scp -r) — e.g. host-side snapshots
-                         of the agent's pi session dir (pi's default
-                         session dir is guest-local: /root/.pi/agent/
-                         sessions/)
 pi-vm list [-v] [--filter KEY=VALUE]... [--sort created|last-run|state|name|id]
               [--reverse]
                          all VMs (docker ps -a style; alias: pi-vm ls)
@@ -146,8 +125,8 @@ pi-vm version           CLI + CH versions, image hashes
 - **One-shell model** — the VM lives exactly as long as the `pi-vm
   create`/`resume` process runs. On attach you land straight in `pi` at
   `/workspace`; exiting `pi` ends the ssh session and stops the VM
-  (graceful guest poweroff). `--shell` attaches a plain shell instead of
-  the agent (exiting the shell stops the VM). The disk persists —
+  (graceful guest poweroff). `--shell` attaches a plain shell instead
+  of pi (exiting the shell stops the VM). The disk persists —
   `pi-vm resume` reboots it. With `--rm`, the VM is deleted (disk +
   state + network) when it stops normally instead of left stopped.
   Need the VM to outlive your terminal? Run
@@ -157,15 +136,6 @@ pi-vm version           CLI + CH versions, image hashes
   omitted for `--no-mount` VMs) via an OSC escape sequence sent to the
   terminal before the session command runs (only when stdout is a tty —
   piped output is left untouched).
-- **Agent VMs** — `<project>/prompt.txt` is the trigger: the pi-vm
-  supervisor starts the detached tmux session 'agent' (over ssh, right
-  after ssh-ready — the ssh session context can read the virtiofs
-  /workspace; the systemd context cannot, SELinux virtiofs_t) that runs
-  the baked launch script (pi with the prompt as its first message).
-  Interactive attaches land in that session; `pi-vm send` types into
-  it; the VM powers itself off when pi exits. No ISO delivery is
-  involved — the prompt is read from the shared folder, so it can be
-  updated between boots (the disk + shared folder persist).
 - **Ownership** — files the agent writes in the guest land on the host
   owned by you: virtiofsd squashes every guest uid to one host uid
   (default: the owner of the shared project dir; for `--no-mount` VMs,
@@ -265,7 +235,7 @@ pi-vm version           CLI + CH versions, image hashes
 - [ ] packaging: an RPM spec for pi-vm (Requires: the seven host packages;
   in that world `pi-vm install` shrinks to: check requirements, CH from
   PATH/$CH_BIN, nested KVM, cloud image) — then publish to terrapkg
-- [x] `install`: stop running the package manager — list the dnf/apt
+- [x] `install`: stop running the package manager — list the dnf
   packages in the README and just check + report what's missing
 - [x] `install`: find a `cloud-hypervisor` already on `PATH` (e.g. a
   terrapkg install) before downloading the static binary ($CH_BIN >
@@ -278,23 +248,6 @@ pi-vm version           CLI + CH versions, image hashes
   now, via the config disk (see the performance item) later. (Deliberately
   NOT a copy of the pi-vm source in the image: it would go stale at bake
   time, and "what am I?" is a data file, not a codebase to grep.)
-- [ ] extract the AUTOMATED usage (the autoresearch loop) into a separate
-  project. History (6d62198 -> 9f46cde -> cb6f188): the prompt-VM
-  machinery (headless prompt run -> --prompt-file/prompt.txt trigger,
-  send, tmux 'agent', LAUNCH_SCRIPT) is the autoresearch interface that
-  grew inside pi-vm, not a human feature — it moves out. The human
-  surface stays: create lands in pi or a shell, resume, attach,
-  --timeout, --rm, ls/rm/fetch/logs (fetch was added for host-side audit
-  snapshots of guest artifacts — the loop uses the same pattern), plus
-  the fan-out machinery (parallel create + subnet allocation). The loop
-  design (no virtiofs at all): per run, copy the baked image, plant
-  prompt + inputs via guestfish, boot via `pi-vm create --no-mount`, a
-  boot script runs `pi "<prompt>"` and powers off, collect outputs +
-  session jsonl (host copy = audit trail; the agent can tamper with the
-  guest copy) via guestfish, keep the disk image as the artifact.
-  `pi/AGENTS.md` STAYS in the core (it is the daily driver's system
-  prompt — the loop runs on the same baked pi config). Open: CoW
-  backing files vs full copy per run, artifact shape, repo location.
 - [ ] reuse between `bake.rs` and `vm.rs` if possible — the guest
   net/ssh/mount setup is duplicated between the baked `pi-vm-net` unit
   and the cloud-init `user_data` runcmd
@@ -363,7 +316,7 @@ truth for "in use".
 | code | meaning |
 |---|---|
 | 0 | success |
-| 1 | generic error (incl. attach/send/fetch: VM not running) |
+| 1 | generic error (incl. attach: VM not running) |
 | 2 | usage / preflight / not-found (rm/logs bad target; missing image, no KVM, name collision, network; resume bad target) |
 | 3 | VM failed to boot (CH exited during boot) / bake verification failed |
 | 4 | ssh did not become reachable within the timeout |
