@@ -438,9 +438,20 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
             let mut child = cmd
                 .spawn()
                 .map_err(|e| BootFail::Preflight(format!("spawn virtiofsd: {e}")))?;
-            thread::sleep(Duration::from_secs(1));
-            if child.try_wait().ok().flatten().is_some() {
-                return Err(BootFail::Preflight("virtiofsd died at startup — see virtiofsd.log".into()));
+            // Wait for the socket to appear (virtiofsd creates it within
+            // milliseconds) — polling replaces a fixed 1 s sleep (boot
+            // profile: it was 1.00 s of the 1.15 s supervisor time).
+            // Capped at 2 s: proceed anyway if it hasn't appeared — CH
+            // fails loudly with a clear error.
+            let sock_wait = std::time::Instant::now() + Duration::from_secs(2);
+            while !sock.exists() {
+                if child.try_wait().ok().flatten().is_some() {
+                    return Err(BootFail::Preflight("virtiofsd died at startup — see virtiofsd.log".into()));
+                }
+                if std::time::Instant::now() > sock_wait {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
             }
             Some(child)
         }
@@ -546,11 +557,13 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     // Respect --timeout (the VM can't be "ready" later than it is going
     // to be killed anyway), capped at 300 s.
     let boot_deadline = timeout_s.map(|t| t.min(300)).unwrap_or(300);
-    let mut waited = 0u64;
+    let mut waited_ms = 0u64;
     let mut ready = false;
-    while waited < boot_deadline {
-        thread::sleep(Duration::from_secs(1));
-        waited += 1;
+    // 500 ms cadence (boot profile: 1 s polling added up to 1 s of
+    // quantization after the guest was ready).
+    while waited_ms < boot_deadline * 1000 {
+        thread::sleep(Duration::from_millis(500));
+        waited_ms += 500;
         if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
             break;
         }
@@ -572,8 +585,8 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
                 break;
             }
         }
-        if waited % 10 == 0 {
-            print!("   booting… ({waited}s)");
+        if waited_ms % 10000 == 0 {
+            print!("   booting… ({}s)", waited_ms / 1000);
             std::io::Write::flush(&mut std::io::stdout()).ok();
         }
     }

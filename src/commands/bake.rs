@@ -600,6 +600,7 @@ echo "pi-vm baking toolchain...";
  echo "dnf1 rc=${{PIPESTATUS[0]}}") || true;
 (timeout 600 dnf install -y docker docker-compose 2>&1 | tail -2;
  systemctl enable --now docker 2>&1 | tail -1;
+ systemctl disable docker 2>&1 | tail -1;
  echo "dnf2 rc=${{PIPESTATUS[0]}}") || true;
 (timeout 300 dnf install -y nodejs npm 2>&1 | tail -2;
  echo "dnf3 rc=${{PIPESTATUS[0]}}") || true;
@@ -672,6 +673,12 @@ const NET_SCRIPT: &str = r#"#!/bin/sh
 # The checks:
 #   0. NM/resolved   -> disabled (the interface stays under manual
 #                      control — idempotent, already off at bake)
+#   0b. docker       -> autostart (non-blocking; deliberately NOT a
+#                      requirement of multi-user.target — a target only
+#                      becomes active once the units it Wants are
+#                      active, and docker's 3-4 s startup would delay
+#                      boot-complete; this timer-driven unit gates
+#                      nothing, so the start is free)
 #   1. virtiofs      -> /workspace (the shared dir; N/A for --no-mount)
 #   2. network       -> static config from the per-VM config disk
 #                      (/dev/vdb, written by the host before boot:
@@ -691,6 +698,10 @@ grow_done=0
 #    bake disabled both; guards against image drift).
 systemctl disable --now NetworkManager 2>/dev/null || true
 systemctl disable --now systemd-resolved 2>/dev/null || true
+
+# 0b. docker: the toolchain's autostart (see the check header) —
+#    non-blocking + idempotent (a running unit is a no-op start).
+systemctl start --no-block docker 2>/dev/null || true
 
 for i in $(seq 1 60); do
   # 1. virtiofs. Give up after 15 consecutive failures (assume no device —
@@ -875,13 +886,14 @@ rm -f /tmp/.pi-vm-sshpub /tmp/.pi-vm-sshsetup
         //    (breaks known_hosts-based reconnects) and costs ~5 s.
         //  - disable daemons not needed at boot (all stay installed, start
         //    on demand): chronyd, auditd, sssd, lvm2-monitor,
-        //    qemu-guest-agent (we're on CH). docker/containerd stay
-        //    enabled (autostart — the runcmd's `systemctl enable --now
-        //    docker` persists; docker.service's Requires= pulls containerd
-        //    in even if its wants symlink were missing). The redundant
-        //    docker.socket wants symlink is still removed (the service
-        //    itself starts at boot, so socket activation adds nothing).
-        cmds.push("command \"sh -c 'for u in cloud-init-main cloud-config cloud-final; do ln -sf /dev/null /etc/systemd/system/$u.service; done; for w in /etc/systemd/system/sockets.target.wants/docker.socket /etc/systemd/system/multi-user.target.wants/chronyd.service /etc/systemd/system/multi-user.target.wants/auditd.service /etc/systemd/system/multi-user.target.wants/audit-rules.service /etc/systemd/system/multi-user.target.wants/sssd.service /etc/systemd/system/multi-user.target.wants/lvm2-monitor.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service; do rm -f $w; done'\"".into());
+        //    qemu-guest-agent (we're on CH). docker starts at boot but is docker/containerd stay
+        //    NOT a requirement of multi-user (a target only becomes
+        //    active once the units it Wants are active — the 3-4 s
+        //    docker startup would delay boot-complete; pi-vm-net
+        //    autostarts it non-blocking at every boot instead). The
+        //    redundant docker.socket wants symlink is also removed
+        //    (socket activation adds nothing here).
+        cmds.push("command \"sh -c 'for u in cloud-init-main cloud-config cloud-final; do ln -sf /dev/null /etc/systemd/system/$u.service; done; for w in /etc/systemd/system/sockets.target.wants/docker.socket /etc/systemd/system/multi-user.target.wants/docker.service /etc/systemd/system/multi-user.target.wants/chronyd.service /etc/systemd/system/multi-user.target.wants/auditd.service /etc/systemd/system/multi-user.target.wants/audit-rules.service /etc/systemd/system/multi-user.target.wants/sssd.service /etc/systemd/system/multi-user.target.wants/lvm2-monitor.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service; do rm -f $w; done'\"".into());
         let ok = guestfish_rw(part, &cmds);
         let _ = std::fs::remove_dir_all(&tmp);
         if !ok {
