@@ -21,8 +21,8 @@ Requirements:
   distro is expected for the package list below
 - rust toolchain installed
 - host packages (install once, with your own package manager):
-  - `dnf install -y virtiofsd cloud-init genisoimage iproute qemu-img iptables libguestfs`
-  - (`libguestfs` is only needed for `pi-vm bake`)
+  - `dnf install -y virtiofsd genisoimage iproute qemu-img iptables libguestfs dnsmasq`
+  - (`genisoimage` + `libguestfs` are only needed for `pi-vm bake`)
 - a Cloud Hypervisor binary — `pi-vm install` picks one up from `$CH_BIN`,
   an existing assets copy, or `PATH` (e.g. a terrapkg install); otherwise
   it downloads the static v53.0 build
@@ -47,14 +47,19 @@ subcommand name (e.g. a dir named `list`) must be given as `./list`.
 
 ```
 pi-vm install           one-time host setup: check requirements (prints
-                         the install command for anything missing), CH +
-                         cloud image (sha256-verified), nested KVM;
-                         prints a hint to run `pi-vm bake`
-pi-vm bake [--pi-dir D] [--timeout N]
+                         the install command for anything missing), shared
+                         VM network (br-pi-vm bridge + a dedicated
+                         dnsmasq), CH + cloud image (sha256-verified),
+                         nested KVM; prints a hint to run `pi-vm bake`
+pi-vm bake [--pi-dir D] [--ssh-key F] [--timeout N]
                          rebuild the pre-baked base image (pi config +
-                         full toolchain + direct-boot kernel assets) —
-                         the VM equivalent of a container image's
-                         build-time COPY
+                         full toolchain + your ssh pubkey + direct-boot
+                         kernel assets) — the VM equivalent of a
+                         container image's build-time COPY
+                         --ssh-key F: the host pubkey to bake into the
+                         image (the guest's root trusts the host user's
+                         ssh key; default: ~/.ssh/*.pub, which must
+                         resolve to exactly one key)
 pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 80]
               [--kvm on|off] [--squash-uid U] [--no-mount]
               [--shell] [--timeout N] [--rm]
@@ -116,9 +121,10 @@ pi-vm version           CLI + CH versions, image hashes
    simplicity.
 3. **Don't break the host** — the VM is isolated (KVM); the only host
    interactions are the shared folder (controlled by #1) and networking.
-   Networking is a private docker-like bridge — no port overlap with the
-   host. Never relabel host dirs (no `restorecon` / `semanage` on shared
-   paths).
+   Networking is a private bridge with NAT — no port overlap with the
+   host, and VMs cannot reach each other (inter-VM traffic is dropped;
+   internet-only). Never relabel host dirs (no `restorecon` /
+   `semanage` on shared paths).
 
 ## How it works
 
@@ -140,22 +146,33 @@ pi-vm version           CLI + CH versions, image hashes
   owned by you: virtiofsd squashes every guest uid to one host uid
   (default: the owner of the shared project dir; for `--no-mount` VMs,
   the invoking user).
-- **Networking** — each VM gets a docker-like bridge (TAP + Linux bridge +
-  iptables NAT) on a private `172.16.N.0/24` — no host port forwarding.
-  Subnet allocation checks both pi-vm's state **and the host's live
-  interfaces**, so a pi-vm running inside one of its own VMs can't
-  collide with the parent's networking. The bridge/tap is verified before
-  boot; a failure aborts with a clear error instead of burning the ssh
-  timeout.
+- **Networking** — all VMs share one Linux bridge (`br-pi-vm`, set up
+  once by `pi-vm install`): each VM gets its own TAP (a random MAC the
+  host generates), a **DHCP** address from a dedicated dnsmasq on the
+  bridge (pool `172.16.0.0/12` — the CGNAT range, so it can't collide
+  with the public internet or a normal LAN), and internet access via
+  iptables NAT — no host port forwarding. Inter-VM traffic is dropped
+  (one iptables rule; the old per-VM `/24` design gave this by
+  construction, on the shared bridge it is policy). The MAC is the
+  supervisor's lookup key: it polls the dnsmasq lease file for the TAP's
+  MAC, then sshes to the leased IP (the host's default ssh key — baked
+  into the image by `pi-vm bake`). A nested pi-vm (running inside one
+  of these VMs) runs its own bridge + dnsmasq on the SAME pool — every
+  level's addresses are on-link at each level, so no subnet allocation
+  or live-interface collision checks are needed. The bridge/tap is
+  verified before boot; a failure aborts with a clear error instead of
+  burning the ssh timeout.
 - **Pre-baked base image** — `pi-vm bake` builds the base image: Fedora 44
   cloud + your pi config + the full toolchain (git, ripgrep, fd, node,
-  python3, cargo/rust, uv, docker + compose, latest pi + pi-web-access +
-  pi-subagents + pi-goal-x) + the direct-boot kernel assets. New VMs boot ready — no
-  first-boot install. Git is pre-configured for sandbox use: safe.directory
+  python3, cargo/rust, uv, docker + compose, dhclient, latest pi +
+  pi-web-access + pi-subagents + pi-goal-x) + your ssh pubkey + the
+  direct-boot kernel assets. New VMs boot ready — no first-boot
+  install. The per-boot `pi-vm-net` unit (DHCP lease wait, virtiofs
+  mount, disk grow, sshd) is baked in too. Git is pre-configured for sandbox use: safe.directory
   is disabled entirely (uid-squashed files don't trigger 'dubious ownership')
   and GPG signing is off (commits don't attempt to sign — the guest has no
   gpg program), with a default user.name/email. Re-run `pi-vm bake` after
-  changing the pi config.
+  changing the pi config (or the ssh key).
   Each new VM records the base image's sha256 in meta.json (shown by
   `pi-vm ls -v`), so you can tell whether it is based on the most
   recent bake (compare against `pi-vm version`).
@@ -200,10 +217,10 @@ pi-vm version           CLI + CH versions, image hashes
   then stops the VM (see above); while booting or in a non-interactive
   run, Ctrl-C stops the VM (exit 130).
 - **Why does ssh take a while to come up?** The baked `pi-vm-net` unit
-  runs a convergence loop (up to 60 s) that brings up the network + ssh as
-  soon as the underlying devices are ready, in parallel with sshd, and
-  self-heals (e.g. interface renames). If ssh never becomes reachable,
-  `create`/`resume` exits 4.
+  runs a convergence loop (up to 60 s) that waits for the DHCP lease +
+  the virtiofs mount, keeps sshd running, and self-heals (e.g. interface
+  renames). If no lease + ssh become reachable within the deadline,
+  `create`/`resume` exits 4 (check dnsmasq with `pi-vm install`).
 - **Can I run two pi-vm processes on one VM?** No — each VM dir is
   flock-protected (exit 5).
 - **Why do `create`/`resume` refuse to boot?** Missing or stale
@@ -242,20 +259,21 @@ pi-vm version           CLI + CH versions, image hashes
   existing assets copy > PATH > download)
 - [ ] give the agent more info about its own environment: write a small
   `vminfo.json` (subset of the host's meta.json: id, vcpus/memory/disk,
-  subnet/ip/mac, project semantics — shared path + uid squash, host os +
+  bridge/ip/mac, project semantics — shared path + uid squash, host os +
   CH version, the create flags) into `<project>/.pi-vm/` before boot;
   referenced from the baked AGENTS.md. `--no-mount` VMs: via the ISO for
   now, via the config disk (see the performance item) later. (Deliberately
   NOT a copy of the pi-vm source in the image: it would go stale at bake
   time, and "what am I?" is a data file, not a codebase to grep.)
-- [ ] reuse between `bake.rs` and `vm.rs` if possible — the guest
-  net/ssh/mount setup is duplicated between the baked `pi-vm-net` unit
-  and the cloud-init `user_data` runcmd
-- [ ] performance: avoid generating the cloud-init NoCloud ISO at all —
-  pre-bake the ssh key + network setup (e.g. a small per-VM config file
-  or disk read by the baked units), set up the network and start CH in
-  parallel, and a slimmer kernel; needs exploration (the ISO currently
-  carries the per-VM ip/host/mac + pubkey + runcmd)
+- [x] reuse between `bake.rs` and `vm.rs` — resolved by the NoCloud ISO
+  removal: the per-boot net/ssh/mount/grow setup is now single-sourced in
+  the baked `pi-vm-net` unit (waits for the DHCP lease; the ssh key is
+  baked in)
+- [x] performance: avoid generating the cloud-init NoCloud ISO at all —
+  done: shared-bridge DHCP + baked ssh key (no per-boot ISO, no per-VM
+  ssh-keygen; the bake's prep ISO stays — build-time, not per-boot)
+- [ ] performance (remaining): set up the network and start CH in parallel
+  (the TAP setup is now pre-boot), and a slimmer kernel
 
 - overlayfs to make the individual vhds smaller
 - gh cli/creds because api rate limits are a bitch, but also not letting it have write access to my accounts
@@ -291,7 +309,6 @@ Resume maybe does pi -r
 
 
 - possible performance improvements:
-  - prebake ssh key and things like networking so we hopefully dont need cloud init / nocloud at all
   - do network setup and ch start in parallel
   - slim kernel for faster CH boot
   - sudo improvements to not pause part way through boot (mentioned earlier)
@@ -304,7 +321,8 @@ Resume maybe does pi -r
   assets/            cloud-hypervisor, kernel, initramfs, kernel-cmdline
                      (direct-boot assets, from `bake`)
   images/            fedora44-cloud.qcow2, fedora44-cloud-prepped.qcow2
-  vms/<12-hex-id>/   meta.json, disk.qcow2, ssh_key, console.log, .lock
+  vms/<12-hex-id>/   meta.json, disk.qcow2, console.log, .lock
+  dnsmasq.conf / dnsmasq.leases / dnsmasq.pid (the dedicated DHCP server)
 ```
 
 Per-VM folder + meta.json (no database): the folder is the source of truth;
@@ -319,7 +337,7 @@ truth for "in use".
 | 1 | generic error (incl. attach: VM not running) |
 | 2 | usage / preflight / not-found (rm/logs bad target; missing image, no KVM, name collision, network; resume bad target) |
 | 3 | VM failed to boot (CH exited during boot) / bake verification failed |
-| 4 | ssh did not become reachable within the timeout |
+| 4 | no DHCP lease / ssh did not become reachable within the timeout |
 | 5 | VM is in use by another pi-vm process |
 | 124 | bake prep boot timed out |
 | 130 | interrupted (Ctrl-C / SIGTERM) — the disk is intact for resume; --rm does not delete |
