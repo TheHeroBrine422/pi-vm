@@ -4,6 +4,7 @@ use clap::{Args, ValueEnum};
 
 use crate::state::{fmt_ts, VmHome, VmMeta, VmState};
 use crate::util::human;
+use crate::vm::BRIDGE;
 
 #[derive(Args)]
 pub struct List {
@@ -175,7 +176,7 @@ impl List {
                 println!("=== {} {} ===", meta.id, meta.name.as_deref().unwrap_or("(no name)"));
                 println!("  state:    {:?}", meta.state);
                 println!("  project:  {}", meta.project.as_deref().unwrap_or("(no mount)"));
-                println!("  network:  {} / {} / {}", meta.subnet, meta.ip, meta.mac);
+                println!("  network:  shared bridge {BRIDGE} / {} / {}", meta.ip, meta.mac);
                 println!(
                     "  resources: {} vcpus, {} MB, {} GB disk, kvm={}, squash_uid={}",
                     meta.vcpus, meta.memory_mb, meta.disk_gb, meta.kvm, meta.squash_uid
@@ -218,7 +219,7 @@ impl List {
 
         println!(
             "{}{}{}{}{}{}{}{}{}{}{}{}{}{}NAME",
-            pad("ID", 12), sep, pad("STATE", 7), sep, pad("SUBNET", 15), sep,
+            pad("ID", 12), sep, pad("STATE", 7), sep, pad("IP", 15), sep,
             pad("CREATED", 23), sep, pad("LAST RUN", 23), sep, pad("PROJECT", proj_w), sep,
             pad("DISK", disk_w), sep
         );
@@ -227,7 +228,7 @@ impl List {
                 "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
                 pad(&meta.id, 12), sep,
                 pad(&meta.state.to_string(), 7), sep,
-                pad(&meta.subnet, 15), sep,
+                pad(&if meta.ip.is_empty() { String::from("-") } else { meta.ip.clone() }, 15), sep,
                 pad(&fmt_ts(meta.created), 23), sep,
                 pad(&fmt_ts(meta.updated), 23), sep,
                 pad(meta.project.as_deref().unwrap_or("-"), proj_w), sep,

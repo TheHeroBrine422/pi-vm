@@ -1,7 +1,7 @@
 //! `pi-vm install` — one-time host-side setup (port of vm/setup.sh).
 //!
-//!   1. checks host requirements (virtiofsd, cloud-init, genisoimage,
-//!      iproute, qemu-img, iptables, libguestfs) and prints the exact
+//!   1. checks host requirements (virtiofsd, genisoimage, iproute,
+//!      qemu-img, iptables, libguestfs, dnsmasq) and prints the exact
 //!      install command for anything missing — the user runs their own
 //!      package manager (the package list is in the README)
 //!   2. locates the Cloud Hypervisor binary: $CH_BIN > existing assets
@@ -29,6 +29,7 @@ impl Install {
             eprintln!("install incomplete: install the packages above, then re-run `pi-vm install`");
             return 1;
         }
+        self.shared_network(home);
         self.ch_binary(home);
         self.nested_kvm();
         self.cloud_image(home);
@@ -43,16 +44,16 @@ impl Install {
     /// packages are reported with the exact dnf command (README has the
     /// package list). Returns false (run aborts) when anything is missing.
     fn requirements(&self, pm: Option<&str>) -> bool {
-        println!("==> [1/4] host requirements (virtiofsd, cloud-init, genisoimage, iproute, qemu-img, iptables, libguestfs)");
+        println!("==> [1/5] host requirements (virtiofsd, genisoimage, iproute, qemu-img, iptables, libguestfs, dnsmasq)");
         // (binary to check, dnf package, note)
         let specs: [(&str, &str, &str); 7] = [
             ("virtiofsd", "virtiofsd", ""),
-            ("cloud-init", "cloud-init", ""),
-            ("genisoimage", "genisoimage", ""),
+            ("genisoimage", "genisoimage", " (bake only)"),
             ("ip", "iproute", ""),
             ("qemu-img", "qemu-img", ""),
             ("iptables", "iptables", ""),
             ("guestfish", "libguestfs", " (bake only)"),
+            ("dnsmasq", "dnsmasq", ""),
         ];
         let missing: Vec<(&str, &str, &str)> = specs
             .iter()
@@ -78,11 +79,22 @@ impl Install {
         false
     }
 
+    /// The shared VM network: one bridge + one dedicated dnsmasq serve
+    /// every VM (the boot path self-heals the same setup — this just
+    /// does it up front with a clear status line).
+    fn shared_network(&self, home: &VmHome) {
+        println!("==> [2/5] shared VM network (br-pi-vm + dnsmasq)");
+        match crate::vm::ensure_shared_network(home) {
+            Ok(()) => println!("   bridge + dnsmasq up (pool 172.16.0.0/12; inter-VM traffic is blocked)"),
+            Err(e) => eprintln!("   WARN: shared network setup failed: {e} (the boot path will retry)"),
+        }
+    }
+
     /// Locate the Cloud Hypervisor binary: $CH_BIN (explicit) > existing
     /// assets copy (version-verified at download) > PATH (a distro or
     /// terrapkg install — symlinked into assets) > static download.
     fn ch_binary(&self, home: &VmHome) {
-        println!("==> [2/4] Cloud Hypervisor binary");
+        println!("==> [3/5] Cloud Hypervisor binary");
         let bin = home.ch_binary();
         let _ = std::fs::create_dir_all(home.assets_dir());
         // $CH_BIN: an explicit existing binary wins. A stale symlink is
@@ -149,7 +161,7 @@ impl Install {
     }
 
     fn nested_kvm(&self) {
-        println!("==> [3/4] nested KVM (so the VM can run its own VMs)");
+        println!("==> [4/5] nested KVM (so the VM can run its own VMs)");
         let mod_out = run("ls", &["/sys/module/"]).unwrap_or_default();
         let kvm_mod = mod_out
             .lines()
@@ -229,7 +241,7 @@ impl Install {
     }
 
     fn cloud_image(&self, home: &VmHome) {
-        println!("==> [4/4] directories + fedora cloud image");
+        println!("==> [5/5] directories + fedora cloud image");
         let _ = std::fs::create_dir_all(home.images_dir());
         let _ = std::fs::create_dir_all(home.assets_dir());
         let _ = std::fs::create_dir_all(home.vms_dir());

@@ -58,9 +58,8 @@ impl Attach {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, terminated.clone());
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTSTP, tstp.clone());
 
-        let key = meta.ssh_key_path(home);
         let mut ssh = std::process::Command::new("ssh");
-        ssh.args(crate::vm::ssh_opts(&key))
+        ssh.args(crate::vm::ssh_opts())
             .arg("-t") // interactive shell needs a pty
             .arg(format!("root@{}", meta.ip))
             .arg("cd /workspace; bash");

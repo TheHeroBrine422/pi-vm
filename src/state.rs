@@ -123,9 +123,10 @@ pub struct VmMeta {
     /// Host path shared into the VM at /workspace (None = --no-mount VM).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    /// e.g. 172.16.55.0/24
+    /// e.g. the shared 172.16.0.0/12 pool (legacy VMs record their per-VM
+    /// 172.16.N.0/24 — see is_legacy_networking)
     pub subnet: String,
-    /// e.g. 172.16.55.2
+    /// The VM's DHCP lease address (last known; empty until first boot)
     pub ip: String,
     /// e.g. 52:54:00:00:00:55
     pub mac: String,
@@ -156,10 +157,6 @@ impl VmMeta {
         self.vm_dir(home).join("disk.qcow2")
     }
 
-    pub fn ssh_key_path(&self, home: &VmHome) -> PathBuf {
-        self.vm_dir(home).join("ssh_key")
-    }
-
     pub fn console_path(&self, home: &VmHome) -> PathBuf {
         self.vm_dir(home).join("console.log")
     }
@@ -168,12 +165,8 @@ impl VmMeta {
         self.vm_dir(home).join(".lock")
     }
 
-    /// Interface names derived from the id (first 8 hex chars — keeps both
-    /// under the 15-char ifname limit: br-<8> = 11, tap-<8> = 12).
-    pub fn bridge_name(&self) -> String {
-        format!("br-{}", &self.id[..8])
-    }
-
+    /// TAP interface name derived from the id (first 8 hex chars — keeps it
+    /// under the 15-char ifname limit: tap-<8> = 12).
     pub fn tap_name(&self) -> String {
         format!("tap-{}", &self.id[..8])
     }
@@ -283,53 +276,41 @@ pub fn resolve(home: &VmHome, arg: &str) -> Result<VmMeta, String> {
 ///    masquerade the parent's own traffic (breaking the parent's
 ///    networking)"). Check both .1 and .2 — the .2 check catches a nested
 ///    VM colliding with its parent's NIC (which is 172.16.N.2).
-pub fn allocate_subnet(home: &VmHome) -> Result<(String, String, String), String> {
-    let used: Vec<String> = home
-        .list_vm_ids()
-        .iter()
-        .filter_map(|id| VmMeta::load(home, id).ok())
-        .map(|m| m.subnet)
-        .collect();
-    // Live 172.16.x.x addresses (bridges, other VMs, a nested pi-vm's parent
-    // NIC). Read-only; runs unprivileged (any user can read interface state).
-    // Degrades to the state-only check if `ip` is unavailable.
-    let live = std::process::Command::new("ip")
-        .args(["-o", "addr", "show"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    let free: Vec<u8> = (2..=251)
-        .filter(|n| {
-            let subnet = format!("172.16.{n}.0/24");
-            !used.contains(&subnet)
-                && !live.contains(&format!("172.16.{n}.1/"))
-                && !live.contains(&format!("172.16.{n}.2/"))
-        })
-        .collect();
-    if free.is_empty() {
-        return Err("no free 172.16.N.0/24 subnet (N in 2..=251)".to_string());
-    }
-    // RANDOM pick from the free set: sequential scanning made every concurrent
-    // `create` race for the same first-free N (duplicate subnets -> all VMs
-    // get .2 -> ssh unreachable). Random makes a collision ~1/250 per pair.
-    let n = free[rand_below(free.len())];
-    let ip = format!("172.16.{n}.2");
-    let mac = format!("52:54:00:00:00:{n:02x}");
-    Ok((format!("172.16.{n}.0/24"), ip, mac))
+/// True for VMs created under the legacy per-VM /24 networking (a unique
+/// 172.16.N.0/24 per VM + NoCloud ISO config). Such VMs' disks carry the
+/// old baked pi-vm-net script and cannot boot on the shared-bridge DHCP
+/// network — resume refuses them with a clear message.
+pub fn is_legacy_networking(meta: &VmMeta) -> bool {
+    meta.subnet.starts_with("172.16.") && meta.subnet.ends_with("/24")
 }
 
-fn rand_below(len: usize) -> usize {
+/// A random locally-administered MAC (the 52:54:00 OUI block keeps pi-vm
+/// TAPs identifiable in `ip link`). The MAC is host-side only: the guest
+/// learns its own address by DHCP (the supervisor matches the dnsmasq
+/// lease on this MAC).
+pub fn random_mac() -> String {
+    let b = rand_bytes(3);
+    format!("52:54:00:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2])
+}
+
+fn rand_bytes(len: usize) -> Vec<u8> {
     use std::io::Read;
-    let mut buf = [0u8; 8];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(&mut buf).is_ok() {
-            return (u64::from_ne_bytes(buf) % len as u64) as usize;
-        }
+    let mut buf = vec![0u8; len];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom")
+        && f.read_exact(&mut buf).is_ok()
+    {
+        return buf;
     }
-    std::time::SystemTime::now()
+    // fallback: time-derived (unique enough for a MAC's 3 random octets;
+    // /dev/urandom failing means something is very wrong)
+    let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as usize % len)
-        .unwrap_or(0)
+        .map(|d| d.as_nanos())
+        .unwrap_or(1);
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = ((n >> (8 * i)) & 0xff) as u8;
+    }
+    buf
 }
 
 /// Current unix timestamp in seconds.
@@ -389,24 +370,13 @@ impl VmLock {
     }
 }
 
-/// Delete a VM's bridge + tap + iptables rules (best-effort, like v1
-/// delete.sh). Privileged (auto-sudo) — the setup path in vm.rs is
-/// privileged too, and a non-root `ip link del` would fail silently.
-/// Deleting the bridge also removes the enslaved tap; the explicit tap
-/// del is the fallback for a tap that was never enslaved.
+/// Delete a VM's TAP (best-effort, like v1 delete.sh). Privileged
+/// (auto-sudo) — the setup path in vm.rs is privileged too, and a
+/// non-root `ip link del` would fail silently. The shared bridge and the
+/// pool-wide iptables rules persist (they serve all VMs).
 pub fn cleanup_network(meta: &VmMeta) {
-    let br = meta.bridge_name();
     let tap = meta.tap_name();
-    let subnet = meta.subnet.clone();
-    for cmd in [
-        vec!["ip", "link", "del", &br],
-        vec!["ip", "link", "del", &tap],
-        vec!["iptables", "-t", "nat", "-D", "POSTROUTING", "-s", &subnet, "-j", "MASQUERADE"],
-        vec!["iptables", "-D", "FORWARD", "-i", &br, "-j", "ACCEPT"],
-        vec!["iptables", "-D", "FORWARD", "-o", &br, "-j", "ACCEPT"],
-    ] {
-        let _ = run_ok_priv(cmd[0], &cmd[1..]);
-    }
+    let _ = run_ok_priv("ip", &["link", "del", &tap]);
 }
 
 /// Remove a VM directory (after locking).
@@ -436,9 +406,9 @@ mod tests {
             created: 0,
             updated: 0,
             project: Some("/tmp".into()),
-            subnet: "172.16.2.0/24".into(),
-            ip: "172.16.2.2".into(),
-            mac: "52:54:00:00:00:02".into(),
+            subnet: "172.16.0.0/12".into(),
+            ip: String::new(),
+            mac: "52:54:00:aa:bb:cc".into(),
             vcpus: 4,
             memory_mb: 8192,
             disk_gb: 80,
@@ -448,7 +418,6 @@ mod tests {
             state: VmState::Stopped,
             ch_pid: None,
         };
-        assert!(meta.bridge_name().len() <= 15);
         assert!(meta.tap_name().len() <= 15);
         let _ = home;
     }
@@ -524,40 +493,48 @@ mod tests {
     }
 
     #[test]
-    fn allocate_subnet_skips_used() {
-        let dir = std::env::temp_dir().join(format!("pi-vm-test-{}", new_id()));
-        let home = VmHome { root: dir.clone() };
-        let id = new_id();
-        let meta = VmMeta {
-            id: id.clone(),
+    fn random_mac_shape_and_oui() {
+        // (format check; the 52:54:00 OUI keeps pi-vm TAPs identifiable)
+        for _ in 0..20 {
+            let m = random_mac();
+            let parts: Vec<&str> = m.split(':').collect();
+            assert_eq!(parts.len(), 6);
+            assert_eq!(parts[0], "52");
+            assert_eq!(parts[1], "54");
+            assert_eq!(parts[2], "00");
+            for p in &parts {
+                assert_eq!(p.len(), 2);
+                assert!(u8::from_str_radix(p, 16).is_ok());
+            }
+        }
+        // 3 random octets: 20 samples must not all collide
+        let distinct = (0..20).map(|_| random_mac()).collect::<std::collections::HashSet<_>>();
+        assert!(distinct.len() > 1);
+    }
+
+    #[test]
+    fn legacy_networking_detection() {
+        let mk = |subnet: &str| VmMeta {
+            id: new_id(),
             name: None,
             created: 0,
             updated: 0,
-            project: Some("/tmp".into()),
-            subnet: "172.16.2.0/24".into(),
-            ip: "172.16.2.2".into(),
-            mac: "52:54:00:00:00:02".into(),
+            project: None,
+            subnet: subnet.into(),
+            ip: String::new(),
+            mac: "52:54:00:aa:bb:cc".into(),
             vcpus: 1,
             memory_mb: 1024,
             disk_gb: 80,
             kvm: true,
-            squash_uid: 1000,
+            squash_uid: 0,
             base_image_sha256: None,
             state: VmState::Stopped,
             ch_pid: None,
         };
-        meta.save(&home).unwrap();
-        let (subnet, ip, mac) = allocate_subnet(&home).unwrap();
-        assert_ne!(subnet, "172.16.2.0/24"); // the state-based skip
-        let n: u8 = subnet
-            .trim_start_matches("172.16.")
-            .trim_end_matches(".0/24")
-            .parse()
-            .unwrap();
-        assert!((3..=251).contains(&n));
-        assert_eq!(ip, format!("172.16.{n}.2"));
-        assert_eq!(mac, format!("52:54:00:00:00:{n:02x}"));
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(is_legacy_networking(&mk("172.16.55.0/24")));
+        assert!(!is_legacy_networking(&mk("172.16.0.0/12")));
+        assert!(!is_legacy_networking(&mk("10.0.0.0/24")));
     }
 
     #[test]
