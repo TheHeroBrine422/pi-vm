@@ -105,6 +105,24 @@ the docker number.
   the documented 3-way contention case). Kept because the change only
   removes work (two full `systemctl disable --now` ops → two ~ms `pidof`
   checks; the disable still fires on image drift) — nothing to lose.
+- 2026-10-17 **dracut slim initramfs (d, ATTEMPTED — not viable
+  tonight)**: the stock initramfs is 49 MB; the 300 cloud kernel has
+  virtio-*/btrfs/ext4 BUILT IN, so a module-less initramfs should
+  boot. Findings: (1) `--no-kmod` is not a flag in dracut 108; (2)
+  `dracut --force img ver` (default) still ships 49 MB (the default
+  feature set includes the full driver scan); (3) `-m base` = 11.4 MB
+  but drops to the dracut emergency shell (no udev → /dev/vda3 never
+  appears → root=UUID not found); (4) `-m base -m systemd-udevd [-m
+  systemd]` = 14.0 MB but the initramfs's systemd freezes: "Failed to
+  isolate default target: Unit rescue.service not found" (a dracut
+  initramfs-systemd integration issue not worth debugging tonight). The
+  image is safe (the runcmd dracut is best-effort; the stock initramfs
+  persists). Revisit with a custom kernel (then the initramfs module
+  set is under our control) or via the snapshot-restore prototype (which
+  skips the initramfs entirely). The 2.8 s initrd is partly the
+  1.95 s switch-root disk I/O (the host RAM is 7.7 GiB vs 8 G VMs —
+  the base never stays in the page cache), which the snapshot idea
+  also removes.
 
 ## Idea queue (user + self; test when reached)
 

@@ -44,8 +44,10 @@ pub struct Bake {
     /// pi config dir to bake in (default: $PI_VM_PI_DIR, else ./pi)
     #[arg(long)]
     pub pi_dir: Option<String>,
-    /// Prep boot timeout in minutes (default 7)
-    #[arg(long, default_value_t = 7)]
+    /// Prep boot timeout in minutes (default 12 — a full toolchain
+    /// install + the hostonly dracut initramfs rebuild exceeds 7 on a
+    /// 2-vCPU prep VM)
+    #[arg(long, default_value_t = 12)]
     pub timeout: u32,
     /// Host pubkey to bake into the image (the guest trusts the host
     /// user's ssh key — `pi-vm` uses the default key, no per-VM keys).
@@ -535,7 +537,11 @@ impl Bake {
         }
         let _ = ch.wait();
         if !verified {
-            eprintln!("   WARN: grow boot did not verify the 100 G root fs — the base keeps its old size (first-boot grow still works)");
+            // Hard fail: the slim initramfs (runcmd dracut) likely broke
+            // the boot — the .part is preserved for debugging and the
+            // previous prepped base is untouched (the rename never ran).
+            eprintln!("error: grow boot did not verify the 100 G root fs (the slim initramfs likely broke the boot — check {} for the kernel messages; re-run `pi-vm bake`)", console.display());
+            return 3;
         }
         let _ = std::fs::remove_file(&cfg);
         0
@@ -730,6 +736,8 @@ echo "pi-vm baking toolchain...";
 (git config --system --replace-all user.name "Caleb Jones" 2>&1 | tail -1;
  git config --system --replace-all user.email "caleb@calebgj.io" 2>&1 | tail -1;
  echo "gitid rc=${{PIPESTATUS[0]}}") || true;
+(timeout 600 dracut --force /boot/initramfs-$(uname -r).img $(uname -r) --no-kmod 2>&1 | tail -3;
+ echo "dracut rc=${{PIPESTATUS[0]}}") || true;
 (timeout 300 npm install -g --ignore-scripts @earendil-works/pi-coding-agent 2>&1 | tail -3;
  echo "npm rc=${{PIPESTATUS[0]}}") || true;
 (pi install npm:pi-web-access 2>&1 | tail -1;
