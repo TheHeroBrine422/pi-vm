@@ -123,6 +123,39 @@ the docker number.
   1.95 s switch-root disk I/O (the host RAM is 7.7 GiB vs 8 G VMs —
   the base never stays in the page cache), which the snapshot idea
   also removes.
+- 2026-10-17 **kernel cmdline (a, verified — already tuned)**: the
+  direct-boot cmdline is `no_timer_check console=tty1
+  systemd.firstboot=off root=UUID=... rootflags=subvol=root console=hvc0`.
+  `no_timer_check` (the main KVM win) is already set; `console=tty1` is
+  a no-op under CH (no VGA — hvc0 carries everything); remaining
+  cmdline options are negligible. **Custom kernel (b, deferred)**: a
+  distro kernel build is 60-90 min on this 4-vCPU host for an
+  estimated 0.5-1 s gain, and the slim-initramfs wall (above) would
+  partially apply to a custom kernel too; deferred behind the
+  snapshot-restore work (which skips kernel + initrd entirely).
+- 2026-10-17 **SNAPSHOT-RESTORE PROTOTYPE (user idea — VALIDATED, the
+  big win)**: on CH 53, `PUT /api/v1/vm.snapshot` works on a running VM
+  (no pre-pause needed) and writes a directory (config.json +
+  memory-ranges + state.json; 952 M for an 8 G VM). Restore = **bare
+  VMM** (`cloud-hypervisor --api-socket ...` only — passing --kernel
+  diverts to the VmBoot branch; the doc's bare-VMM variant is the only
+  way in 53) + `PUT /api/v1/vm.restore` with `{"source_url":"file:///…",
+  "memory_restore_mode":"OnDemand","resume":true}` (case matters).
+  Result: **restore 204 → TCP open 0.26 s → ssh OK in the same second**
+  (vs 15-20 s cold). Verified: ondemand paging (guest RAM 467 MiB
+  resident post-restore); **virtiofs survives the virtiofsd rebind**
+  (fresh virtiofsd on the same socket path before the restore is
+  enough — `ls /workspace` worked, no guest agent needed for the
+  mount); TAP recreated with the snapshot MAC before restore. Caveats:
+  config.json bakes the VM-dir paths (disk/config.raw/console/fs.sock —
+  the restored VM must run from the same directory); the restored VM
+  keeps the template's (IP, MAC) — a pool slot is a fixed (IP, MAC)
+  pair; the snapshot is single-use per VM dir (the adopted VM's disk
+  diverges → no re-restore, which is fine). **Implementation next:
+  bake builds a default-spec (4 vCPU / 8 G) template snapshot
+  (soft-fail); a default-spec `create` adopts it (meta snapshot flag,
+  fixed slot IP/MAC, boot() bare-VMM + vm.restore path); non-default
+  specs fall back to the cold path.**
 
 ## Idea queue (user + self; test when reached)
 
