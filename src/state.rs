@@ -218,8 +218,8 @@ impl VmMeta {
     }
 }
 
-/// True if the process is alive (checked via /proc — the same pattern as
-/// `send`). A "running" record whose supervisor pid is dead (host reboot,
+/// True if the process is alive (checked via /proc). A "running" record
+/// whose supervisor pid is dead (host reboot,
 /// kill -9 of the supervisor) is just a record of the last session.
 pub fn pid_alive(pid: i32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
