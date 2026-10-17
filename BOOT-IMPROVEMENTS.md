@@ -7,6 +7,16 @@ immediately.
 ## Current baseline (build `fcb98e7` = config-disk networking + virtiofsd poll +
 0.5 s probe + docker detached from multi-user)
 
+**Final overnight medians (same-window gate runs, 2026-10-17):**
+**adopt (warm pool, default spec) 9.7 s** (11.7 / 9.0 / 9.7) · **cold
+create 22.9 s** (20.9–24.2 window) · resume (cold) 22.3–23.6 s. The
+`fcb98e7` baseline below (16.6 / 15.1 / 15.9 s) is from its own
+less-loaded window — the host drifted ±30% over the night, so only
+same-window comparisons are meaningful. The user-facing win:
+a default-spec create adopts the bake-time snapshot pool and is ~13 s
+faster than a cold boot in the same window (the raw restore is
+sub-second; 9.7 s = the 8 G ondemand page-in).
+
 | metric | value |
 |---|---|
 | create, total to ssh-ready | 13.5–16.1 s (samples: 13.5, 15.2, 16.1, 17.4, 13.7 — variance ±2 s) |
@@ -151,11 +161,23 @@ the docker number.
   the restored VM must run from the same directory); the restored VM
   keeps the template's (IP, MAC) — a pool slot is a fixed (IP, MAC)
   pair; the snapshot is single-use per VM dir (the adopted VM's disk
-  diverges → no re-restore, which is fine). **Implementation next:
-  bake builds a default-spec (4 vCPU / 8 G) template snapshot
-  (soft-fail); a default-spec `create` adopts it (meta snapshot flag,
-  fixed slot IP/MAC, boot() bare-VMM + vm.restore path); non-default
-  specs fall back to the cold path.**
+  diverges → no re-restore, which is fine). **Implemented + e2e-gated
+  (commit e23361d)**: bake's final step boots a default-spec template
+  to full readiness, quiesces it (`systemctl is-system-running` + 90 s
+  idle — a mid-boot snapshot makes the restore re-run the rest of the
+  boot: an 8 G ondemand page-in storm that OOM-killed CH on this 7.7 G
+  host), pauses it, snapshots it (soft-fail), and leaves it stopped as
+  the pool. A default-spec create (4 vCPU / 8 G / 100 G) adopts it:
+  fresh CH (bare VMM + `vm.restore`), TAP recreated with the
+  snapshot's name from config.json, virtiofsd re-bound on the same
+  socket. Same-window gate results: **adopt 9.0–11.7 s to ssh vs cold
+  20.9–24.2 s (−9 to −14 s; 3 gate runs: 11.7/9.0/9.7 vs cold median
+  22.9)**; the raw restore is sub-second — the
+  remainder is the ondemand page-in of the guest's working set + the
+  adopter's virtiofsd serving a different project dir. The e2e gate is
+  pool-preserving (restores the template meta after the adopter's
+  final stop, so consecutive runs re-adopt). Non-default specs fall
+  back to the cold path.
 
 ## Idea queue (user + self; test when reached)
 
