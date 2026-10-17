@@ -516,7 +516,7 @@ fi
         r#"
 exec >> /root/bake-debug.log 2>&1;
 echo "pi-vm baking toolchain...";
-(timeout 300 dnf install -y git curl wget ripgrep fd xz bzip2 tar gzip xfsprogs python3 python3-pip cargo uv which cloud-utils-growpart btrfs-progs tmux 2>&1 | tail -3;
+(timeout 300 dnf install -y git curl wget ripgrep fd xz bzip2 tar gzip xfsprogs python3 python3-pip cargo uv which cloud-utils-growpart btrfs-progs 2>&1 | tail -3;
  echo "dnf1 rc=${{PIPESTATUS[0]}}") || true;
 (timeout 600 dnf install -y docker docker-compose 2>&1 | tail -2;
  systemctl enable --now docker 2>&1 | tail -1;
@@ -729,31 +729,6 @@ const NET_SERVICE: &str = "[Unit]\nDescription=pi-vm network and ssh setup from 
 // ticks are no-ops. It never blocks multi-user (the timer is passive).
 const NET_START_TIMER: &str = "[Unit]\nDescription=Start pi-vm network setup (repeating until the root fs is up)\n\n[Timer]\nOnBootSec=1s\nOnUnitActiveSec=1s\nUnit=pi-vm-net.service\n\n[Install]\nWantedBy=timers.target\n";
 
-/// The guest launch script for agent VMs (baked into the image — no
-/// per-VM customization, so no ISO delivery). Reads the prompt from the
-/// shared folder (the CONTENT never passes through a shell) and passes it
-/// to pi as the first message (pi stays interactive afterwards — `pi
-/// "msg"` without --print). The pi-vm supervisor starts the tmux session
-/// that runs it (over ssh — the ssh session context can read the virtiofs
-/// /workspace; the systemd context cannot, SELinux virtiofs_t). When run
-/// with PI_VM_SERVICE set, the script powers the VM off when pi exits,
-/// freeing the VM for the next one.
-const LAUNCH_SCRIPT: &str = r##"#!/bin/bash
-cd /workspace
-P=$(cat /workspace/prompt.txt 2>/dev/null)
-if [ -n "$P" ]; then
-pi "$P"
-else
-pi
-fi
-rc=$?
-if [ -n "$PI_VM_SERVICE" ]; then
-echo "pi-vm-agent: pi exited (rc=$rc) — powering off"
-systemctl poweroff
-fi
-exit $rc
-"##;
-
 /// Write the net-fallback script + units into the baked image (one
 /// patient guestfish RW session; the -i inspection mounts the btrfs
 /// root subvolume at /sysroot).
@@ -761,11 +736,10 @@ fn write_net_fallback(part: &std::path::Path) {
     println!("   installing the cloud-init-independent net fallback");
     let tmp = std::env::temp_dir().join(format!("pi-vm-netfb-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
-    let entries: [(&str, &str); 4] = [
+    let entries: [(&str, &str); 3] = [
         ("pi-vm-net.sh", NET_SCRIPT),
         ("pi-vm-net.service", NET_SERVICE),
         ("pi-vm-net-start.timer", NET_START_TIMER),
-        ("pi-vm-launch.sh", LAUNCH_SCRIPT),
     ];
     for (name, content) in &entries {
         if std::fs::write(tmp.join(name), content).is_err() {
@@ -786,7 +760,7 @@ fn write_net_fallback(part: &std::path::Path) {
     cmds.push("mkdir-p /workspace".into());
     // guestfish `ln` makes a HARD link (systemd needs a symlink); the
     // appliance has sh, so do the symlinks + chmod in one sh -c.
-    cmds.push("command \"sh -c 'rm -f /etc/systemd/system/multi-user.target.wants/pi-vm-net.service /etc/systemd/system/pi-vm-net-late.service /etc/systemd/system/pi-vm-net-late.timer /etc/systemd/system/timers.target.wants/pi-vm-net-late.timer /etc/systemd/system/pi-vm-agent.service /etc/systemd/system/pi-vm-agent-start.timer /etc/systemd/system/timers.target.wants/pi-vm-agent-start.timer; ln -sf /etc/systemd/system/pi-vm-net-start.timer /etc/systemd/system/timers.target.wants/pi-vm-net-start.timer; chmod 755 /usr/local/bin/pi-vm-net.sh /usr/local/bin/pi-vm-launch.sh'\"".into());
+    cmds.push("command \"sh -c 'rm -f /etc/systemd/system/multi-user.target.wants/pi-vm-net.service /etc/systemd/system/pi-vm-net-late.service /etc/systemd/system/pi-vm-net-late.timer /etc/systemd/system/timers.target.wants/pi-vm-net-late.timer /etc/systemd/system/pi-vm-agent.service /etc/systemd/system/pi-vm-agent-start.timer /etc/systemd/system/timers.target.wants/pi-vm-agent-start.timer; ln -sf /etc/systemd/system/pi-vm-net-start.timer /etc/systemd/system/timers.target.wants/pi-vm-net-start.timer; chmod 755 /usr/local/bin/pi-vm-net.sh'\"".into());
     // Boot optimizations (persist to the baked image):
     //  - mask cloud-init's later stages: only the local stage matters
     //    (runcmd); main regenerates the ssh host keys on EVERY boot
@@ -1024,7 +998,7 @@ fn guestfish_run(image: &std::path::Path, cmds: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{user_data, LAUNCH_SCRIPT, NET_SCRIPT};
+    use super::{user_data, NET_SCRIPT};
 
     /// The generated user-data must stay valid YAML: each runcmd entry is
     /// a multi-line plain scalar (one `bash -c '...'` per entry) with no
@@ -1082,27 +1056,6 @@ mod tests {
         }
         let o = child.wait_with_output().expect("wait");
         assert!(o.status.success(), "bash -n failed on NET_SCRIPT: {}", String::from_utf8_lossy(&o.stderr));
-    }
-
-    /// The baked launch script is what runs the agent — syntax-check it.
-    #[test]
-    fn launch_script_is_valid_shell() {
-        use std::io::Write;
-        let mut child = std::process::Command::new("bash")
-            .arg("-n")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn bash");
-        {
-            let mut si = child.stdin.take().expect("stdin");
-            si.write_all(LAUNCH_SCRIPT.as_bytes()).expect("write");
-        }
-        let o = child.wait_with_output().expect("wait");
-        assert!(o.status.success(), "bash -n failed on LAUNCH_SCRIPT: {}", String::from_utf8_lossy(&o.stderr));
-        assert!(LAUNCH_SCRIPT.contains("cat /workspace/prompt.txt"), "the prompt must come from the shared folder");
-        assert!(LAUNCH_SCRIPT.contains("systemctl poweroff"), "must power off when pi exits under the service");
     }
 }
 
