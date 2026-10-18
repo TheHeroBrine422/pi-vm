@@ -88,10 +88,10 @@ run_once() { # $1 = label, $2 = create|resume
   grep -E "master adoption|snapshot restore|renumbered|booting" "$log" >> "$OUT"
   echo "   settle 60 s (let docker et al. finish) ..."
   sleep 60
-  if [ -n "$(ip_of "$2")" ] && [ "$(state_of "$2")" = "running" ]; then
-    profile_guest "$label" "$2"
+  if [ -n "$(ip_of P)" ] && [ "$(state_of P)" = "running" ]; then
+    profile_guest "$label" P
   else
-    echo "   SKIPPED guest profile ($label): not running (state=$(state_of "$2"))" >> "$OUT"
+    echo "   SKIPPED guest profile ($label): not running (state=$(state_of P))" >> "$OUT"
   fi
   for i in $(seq 1 300); do [ "$(state_of P)" = "stopped" ] && break; sleep 2; done
   [ "$(state_of P)" = "stopped" ] || echo "   WARN: P not stopped after $label" >> "$OUT"
@@ -100,6 +100,12 @@ run_once() { # $1 = label, $2 = create|resume
 run_once cold-create create
 run_once resume resume
 
-$BIN rm --force P > /dev/null 2>&1
+for a in 1 2 3 4 5 6; do
+  $BIN rm --force P > /dev/null 2>&1 && break
+  # the meta flips to "stopped" while the previous supervisor still
+  # holds the flock through teardown -> retry until the lock frees
+  echo "   P not deletable yet (in-flight stop), retry $a ..."
+  sleep 15
+done
 rm -rf "$S"
 echo "profile: $OUT"

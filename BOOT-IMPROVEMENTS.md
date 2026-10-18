@@ -196,37 +196,56 @@ the docker number.
 the guest's systemd breakdown for one cold create and one resume; run it
 on both machines and compare **phase shapes**, not absolutes.
 
-**Cold create, same code path (0.2.0), user's host vs this box:**
+**Cold create (user's host, 0.2.0) vs resume cold boot (this box, 0.3.0) — same
+boot class (kernel + initrd + userspace all run):**
 
-| phase | user host (7800X3D, 16 c, 61 G, NVMe btrfs, bare metal) | this box (nested, 4 c, 7.7 G) |
-|---|---|---|
-| supervisor (lock/net+tap/virtiofsd/ch) | 0.00 / **0.52** / 0.02 / 0.00 | 0.00 / 0.04 / 0.02 / 0.00 |
-| guest (ch-spawn → ssh-ready) | **6.9 s** | **15.0 s** |
-| total | **7.5 s** | **15.1 s** |
-| systemd kernel | 0.455 s | (paired run pending) |
-| systemd initrd | **2.282 s** | (pending) |
-| systemd userspace (all) | 4.363 s | (pending) |
-| multi-user.target | 3.263 s | (pending) |
+| phase | user host (7800X3D, 16 c, 61 G, NVMe btrfs, bare metal) | this box (nested, 4 c, 7.7 G) | ratio |
+|---|---|---|---|
+| supervisor (lock/net+tap/virtiofsd/ch) | 0.00 / **0.52** / 0.02 / 0.00 | 0.00 / 0.04 / 0.02 / 0.00 | — |
+| guest (ch-spawn → ssh-ready) | **6.9 s** | 18.2 s (resume, slow window; creates 15.0) | ~2.3× |
+| total | **7.5 s** | 18.2 s (slow window; 15.1 typical) | ~2.3× |
+| systemd kernel | 0.455 s | **5.557 s** | **12×** |
+| systemd initrd | **2.282 s** | 3.371 s | 1.5× |
+| systemd userspace (all) | 4.363 s | 11.748 s | 2.7× |
+| multi-user.target | 3.263 s | 5.974 s | 1.8× |
+| udev device wall (blame top) | ~2.5 s | ~5.8 s | 2.3× |
 
-Shape conclusions from the host sample:
+Shape conclusions, both samples:
 
-- **The guest dominates (6.9 of 7.5 s)** — supervisor-side work is
-  already noise on a real host; there is nothing to win there.
-- **The initrd is the single biggest guest item (2.28 s = 33 %)** and it
-  is pure overhead for a VM: virtio + btrfs are built into the cloud
-  kernel, so the dracut initramfs mostly runs udev to discover a device
-  that was never going to be missing (`blame` shows every device unit
-  appearing at ~2.5 s — the udev wall — then switch-root). Confirms the
-  slim-initramfs idea (queued, previously attempted) as the top
-  cold-boot target; its value is ~2 s on the *cold fallback and every
-  resume*, not on the adoption path.
-- **NEW concrete win: `systemd-binfmt` sits ON the critical chain**
-  (`sysinit.target ← systemd-binfmt +1.014s ← … ← multi-user @3.263s`).
-  Masking `systemd-binfmt` (+ `systemd-modules-load` if it shows up in
-  the paired sample) is a ~1 s cold-boot saving with no functional cost
-  for this image (no foreign-architecture binfmt handling in a sandbox).
-- `docker.service +951ms` starts after basic.target but is deliberately
-  not a multi-user requirement — ssh-ready (our metric) is unaffected.
+- **The guest dominates (6.9 of 7.5 s on the host; ~18 s here)** —
+  supervisor-side work is noise on both; there is nothing to win there.
+- **The kernel phase is the nested box's defining cost (5.6 s = 27 % of
+  the 20.7 s systemd total, 12× the host's 0.455 s)**: kernel + 49 MB
+  initramfs load + early init over the nested virtio-blk on a loaded
+  4-vCPU host. On the user's host the kernel phase is 6 % — negligible.
+  Implication: cold-boot tuning for *this* class of box is disk/CPU-
+  bound, not unit-bound; the host's tuning levers (below) transfer,
+  but their absolute value is smaller than the kernel phase.
+- **On the user's host, the initrd is the single biggest guest item
+  (2.28 s = 33 %)** and it is pure overhead for a VM: virtio + btrfs
+  are built into the cloud kernel, so the dracut initramfs mostly runs
+  udev to discover a device that was never going to be missing
+  (`blame`: every device unit appears at ~2.5 s — the udev wall — then
+  switch-root). Confirms the slim-initramfs idea (queued, previously
+  attempted) as the top cold-boot target on fast hosts; its value is
+  ~2 s on the *cold fallback and every resume*, not on the adoption
+  path.
+- **NEW concrete win (both samples): `systemd-binfmt` sits ON the
+  critical chain** — on the host `sysinit.target ← systemd-binfmt
+  +1.014s ← … ← multi-user @3.263s`, here `… ← binfmt_misc.automount
+  @1.917s`. Masking `systemd-binfmt` (and `systemd-modules-load` if it
+  shows up) is a ~1 s cold-boot saving with no functional cost for
+  this image (no foreign-architecture binfmt handling in a sandbox).
+- Critical-chain tail differs: host goes through `logind` (no serial
+  console getty in the chain), this box through
+  `getty.target ← serial-getty@hvc0` (5.974 s) — the console getty is
+  on the chain here; a `console=hvc0`-driven getty could be masked for
+  ~0.2-0.5 s, but the console is the only debug path in these VMs —
+  not worth it.
+- `docker.service +951ms` (host) starts after basic.target but is
+  deliberately not a multi-user requirement — ssh-ready (our metric) is
+  unaffected; docker is ~1 s there, ~3-4 s here (consistent with the
+  2.7× userspace scale).
 - The user's first run showed `net+tap 4.83 s` — that was the **sudo
   password prompt inside the measured window** (0.2.0 has no priming).
   Fixed on main: `util::prime_sudo()` at the start of
