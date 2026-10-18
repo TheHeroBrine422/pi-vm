@@ -1,6 +1,6 @@
 [package]
 name = "pi-vm"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 description = "docker-like CLI for the pi VM sandbox (Cloud Hypervisor + virtiofsd)"
 license = "MIT"

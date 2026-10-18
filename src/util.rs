@@ -30,6 +30,25 @@ pub fn is_root() -> bool {
     run("id", &["-u"]).map(|u| u == "0").unwrap_or(true)
 }
 
+/// Prime sudo's 5-minute lease once, at command start (non-root hosts
+/// only). Without this, the FIRST privileged call inside a boot lands
+/// mid-timed-phase: sudo prompts for the password and the pause counts
+/// into that phase's measured duration (net+tap in the boot timing line),
+/// poisoning the numbers. With this, the prompt (if the lease is stale)
+/// happens once, before any timing starts; a valid lease makes the check
+/// a silent ~ms no-op. `sudo -n true` = non-interactive: succeeds iff a
+/// valid timestamp exists, fails fast otherwise (no hang).
+pub fn prime_sudo() {
+    if is_root() {
+        return;
+    }
+    if run_ok("sudo", &["-n", "true"]) {
+        return;
+    }
+    eprintln!("   sudo required for the host network setup — enter your password now (once per ~5 min window)");
+    let _ = run_ok("sudo", &["-v"]);
+}
+
 /// Run a privileged command (auto-sudo when not root — v1's $SUDO pattern).
 pub fn run_priv(cmd: &str, args: &[&str]) -> Result<String, String> {
     if is_root() {

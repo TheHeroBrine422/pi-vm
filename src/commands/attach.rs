@@ -124,7 +124,6 @@ mod tests {
             ch_pid,
             net_gen: Some(2),
             snapshot: false,
-            vm_dir_override: None,
             base_image_sha256: None,
         }
     }

@@ -59,6 +59,17 @@ the docker number.
 
 (format: date, change, 3-sample before→after medians, kept/reverted + commit)
 
+- 2026-10-17 **0.3.0 reusable snapshot master — first green on a fresh box, 3 gate samples**: full chain rebuilt from scratch (deps, `cargo install` main, `install`, `bake`, `e2e`): the bake's unverified warm step worked first try ("system settled — 90 s quiesce" then snapshot 204 then "snapshot master ready"). 3 consecutive GATE-OK; same-window totals:
+  | metric | s1 | s2 | s3 | median |
+  |---|---|---|---|---|
+  | adopt A (1st create) | 9.3 | 9.1 | 9.0 | **9.1 s** |
+  | adopt B (parallel, serialized) | 9.1 | 9.5 | 9.2 | **9.2 s** |
+  | resume A (cold) | 15.6 | 14.6 | 15.6 | **15.6 s** |
+  | resume B (cold) | 15.7 | 15.1 | 16.3 | **15.7 s** |
+  | cold C (--disk 40 fallback) | 17.2 | 15.5 | 24.8 | **17.2 s** |
+  Adopt is 6-8 s faster than cold in the same window (~45 %). **The restore-phase breakdown** (new `[restore]` line) explains the rest: a single adopt = adopt-lock 0.02 + **restore 8.82** + master-ssh 1.17 + renumber 1.38 s. The `vm.restore` 204 call itself is 8.8 s here: Copy reads the 8 G memory file, and it is no longer page-cache-resident (a 7.7 G host cannot hold it; the bake's one-time pre-warm is gone). On a 61 G host the file stays cached and the same call is ~1-2 s — adoption there should land ~3-4 s total (the section-8 expectation was calibrated to the warm-file A/B). **New experiment candidate: OnDemand on a cold cache** — the warm-file A/B (Copy 1.45 vs OnDemand 2.71 to ssh) does not transfer to a cold cache: OnDemand pages only the working set (~1-2 G) while Copy reads all 8 G; A/B the two modes here before re-baking.
+  Two renumbering bugs found + fixed on the first runs (details in the section below): the link-down flushes the default route (no internet for adopters), and deleting the baked-in address inside the attached ssh black-holes the session (renumbering hung forever). Fix: detached `setsid` renumbering + explicit old-address delete + default-route re-add; `renumber_cmd()` is unit-tested for the single-quote invariant. virtiofs verified post-restore by hand.
+
 - 2026-10-17 **BASELINE (build fcb98e7 = c4a3bdb + config-disk networking), 3 e2e-gate samples**:
   | metric | s1 | s2 | s3 | median |
   |---|---|---|---|---|
@@ -178,6 +189,95 @@ the docker number.
   pool-preserving (restores the template meta after the adopter's
   final stop, so consecutive runs re-adopt). Non-default specs fall
   back to the cold path.
+
+## Paired boot profiles — nested box vs the user's bare-metal host (2026-10-17)
+
+`profile-boot.sh` (repo root) emits the host context + per-boot timing +
+the guest's systemd breakdown for one cold create and one resume; run it
+on both machines and compare **phase shapes**, not absolutes.
+
+**Cold create, same code path (0.2.0), user's host vs this box:**
+
+| phase | user host (7800X3D, 16 c, 61 G, NVMe btrfs, bare metal) | this box (nested, 4 c, 7.7 G) |
+|---|---|---|
+| supervisor (lock/net+tap/virtiofsd/ch) | 0.00 / **0.52** / 0.02 / 0.00 | 0.00 / 0.04 / 0.02 / 0.00 |
+| guest (ch-spawn → ssh-ready) | **6.9 s** | **15.0 s** |
+| total | **7.5 s** | **15.1 s** |
+| systemd kernel | 0.455 s | (paired run pending) |
+| systemd initrd | **2.282 s** | (pending) |
+| systemd userspace (all) | 4.363 s | (pending) |
+| multi-user.target | 3.263 s | (pending) |
+
+Shape conclusions from the host sample:
+
+- **The guest dominates (6.9 of 7.5 s)** — supervisor-side work is
+  already noise on a real host; there is nothing to win there.
+- **The initrd is the single biggest guest item (2.28 s = 33 %)** and it
+  is pure overhead for a VM: virtio + btrfs are built into the cloud
+  kernel, so the dracut initramfs mostly runs udev to discover a device
+  that was never going to be missing (`blame` shows every device unit
+  appearing at ~2.5 s — the udev wall — then switch-root). Confirms the
+  slim-initramfs idea (queued, previously attempted) as the top
+  cold-boot target; its value is ~2 s on the *cold fallback and every
+  resume*, not on the adoption path.
+- **NEW concrete win: `systemd-binfmt` sits ON the critical chain**
+  (`sysinit.target ← systemd-binfmt +1.014s ← … ← multi-user @3.263s`).
+  Masking `systemd-binfmt` (+ `systemd-modules-load` if it shows up in
+  the paired sample) is a ~1 s cold-boot saving with no functional cost
+  for this image (no foreign-architecture binfmt handling in a sandbox).
+- `docker.service +951ms` starts after basic.target but is deliberately
+  not a multi-user requirement — ssh-ready (our metric) is unaffected.
+- The user's first run showed `net+tap 4.83 s` — that was the **sudo
+  password prompt inside the measured window** (0.2.0 has no priming).
+  Fixed on main: `util::prime_sudo()` at the start of
+  create/resume/bake/install asks once *before* any timing starts (no
+  NOPASSWD — the user declined that for security reasons). Real net+tap
+  on the host is 0.52 s vs 0.04 s here (the tap/bridge ioctls are not
+  free on a busy host, but 10× slower than nested is odd — recheck after
+  priming lands).
+- Caveats for reading the nested numbers: the outer load on this box
+  drifts ±30 % over hours (all units scale together), and the small-RAM
+  host is what makes the mid-boot-snapshot OOM mode possible at all — on
+  a 61 G host that restore is not a memory hazard, so a couple of this
+  box's guardrails (quiesce before snapshot, Copy vs OnDemand choice)
+  may be tunable per-host later.
+- The user's **resume** profile came back empty: that is the documented
+  resume/lock race (0.2.0 takes the flock with no wait and meta flips to
+  `stopped` while the old supervisor still holds it → `resume` exits 5),
+  already fixed on main by the 120 s lock-wait. `profile-boot.sh` now
+  retries the resume so the profile is valid on either build.
+
+## Snapshot master: first end-to-end run + the two renumbering bugs (2026-10-17)
+
+Fresh VM (no state survived), so the whole chain was rebuilt from
+scratch on `main`: deps → `cargo install` → `install` → `bake` → gate.
+
+- **The bake's unverified warm step worked** on the first try: "system
+  settled — 90 s quiesce" → snapshot 204 → "snapshot master ready" (the
+  created-template rule held; §4's created-vs-resumed finding is now
+  verified in the automated bake path, not just by hand).
+- **Adoption works**: A/B both adopted, reflink disk + hardlinked
+  snapshot, `renumbered 172.16.239.114 -> <own ip>`, **9.1–9.5 s** to
+  ssh vs 15.0–15.1 s cold in the same window, master untouched after
+  several adopters. virtiofs verified post-restore by hand (the gate
+  does not cover /workspace).
+- **Bug 1 — adopted VMs had no internet.** The renumbering's `ip link set
+  dev $IF down` FLUSHES the default route the snapshot carried (the
+  kernel drops routes via a downed link). ssh worked (on-link route is
+  enough), so only the gate's NAT check caught it. Fix: re-add
+  `ip route replace default via <gw>` after the link is up.
+- **Bug 2 — the renumbering ssh hung forever.** `ip addr replace` ADDS,
+  it does not replace, so the master's baked-in IP stayed configured
+  (pinning the connected route's `src` to the stale address, and leaving
+  two restored guests able to answer the master's IP). Deleting it is
+  correct — but doing it inside the attached ssh deletes that session's
+  OWN source address, so the session black-holes and `ssh` hangs
+  (ConnectTimeout only bounds connect-setup). Fix: run the renumbering
+  DETACHED (`setsid bash -c … >/tmp/pi-vm-renumber.log 2>&1 </dev/null &`)
+  and verify success by waiting for the VM's own IP; keepalives
+  (ServerAliveInterval=2 ×2) as a backstop. The command builder is now a
+  separate `renumber_cmd()` with a unit test asserting the single-quote
+  invariant (the inner script is passed inside a single-quoted `bash -c`).
 
 ## Idea queue (user + self; test when reached)
 

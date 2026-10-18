@@ -56,11 +56,12 @@ pi-vm bake [--pi-dir D] [--ssh-key F] [--timeout N]
                          full toolchain + your ssh pubkey + direct-boot
                          kernel assets) — the VM equivalent of a
                          container image's build-time COPY. The last
-                         step also snapshots a warm template VM and
-                         leaves it stopped: the next default-spec
-                         create adopts it (see `create`) so its first
-                         boot is a sub-second snapshot restore instead
-                         of a cold boot
+                         step builds the snapshot MASTER: it boots one
+                         default-spec template VM, waits for systemd to
+                         settle plus a 90 s quiesce, snapshots it, and
+                         leaves it stopped. Every later default-spec
+                         create restores from that master (see `create`)
+                         and the master itself is never consumed
                          --ssh-key F: the host pubkey to bake into the
                          image (the guest's root trusts the host user's
                          ssh key; default: ~/.ssh/*.pub, which must
@@ -73,12 +74,14 @@ pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 100]
                          /workspace in the guest); boots and (if the
                          terminal is interactive) attaches an ssh session
                          that starts in pi (cd /workspace; pi).
-                         A default-spec create (4 vCPU / 8 G / 100 G)
-                         adopts the bake-time warm template when the
-                         pool is available: the first boot is a
-                         snapshot restore (a few seconds to ssh instead
-                         of a cold boot); any other spec falls back to
-                         a normal cold boot
+                         A default-spec create (4 vCPU / 8 G / the
+                         master's disk size) adopts the snapshot master
+                         when it is available: the first boot is a
+                         snapshot restore (roughly half a cold boot on a
+                         small host; a few seconds) instead of a cold
+                         boot, then the VM is renumbered to its own pool
+                         IP + MAC. Any other spec, or a missing master,
+                         falls back to a normal cold boot
                          --timeout N: stop the VM N seconds after launch
                          (boot time counts against it)
                          --rm: when the VM stops normally (the attach
@@ -192,32 +195,54 @@ pi-vm version           CLI + CH versions, image hashes
   Each new VM records the base image's sha256 in meta.json (shown by
   `pi-vm ls -v`), so you can tell whether it is based on the most
   recent bake (compare against `pi-vm version`).
-- **Warm snapshot pool** — the last step of `pi-vm bake` boots a
-  template VM to full readiness, pauses it, and snapshots it
-  (Cloud Hypervisor `vm.snapshot`, on-demand memory mode) before
-  leaving it stopped as the pool. The next default-spec create
-  (4 vCPU / 8 G / 100 G) adopts the pool: instead of a cold boot it
-  restores the snapshot into a fresh CH instance — ssh-ready in a
-  few seconds (the on-demand page-in of the guest's working set
-  dominates; the raw restore itself is sub-second). The template's
-  IP/MAC are fixed (the snapshot bakes them in), so the adopter
-  reuses the pool slot's pair. The pool is single-use per bake:
-  the adopter's meta overwrites the template's, and any other spec
-  (or a missing pool) falls back to a normal cold boot. A resumed
-  adopted VM boots cold from the template's disk (the snapshot is
-  one-shot). The shared mount is re-provisioned on the host side —
-  virtiofs survives the virtiofsd rebind, so no guest-side agent
-  is needed.
+- **Snapshot master (reusable)** — the last step of `pi-vm bake` builds
+  a *reusable* warm master: it boots one default-spec template VM
+  (4 vCPU / 8 G / 100 G, id `dead00000001`, name `warm-default`), waits
+  for systemd to settle plus a 90 s idle quiesce, takes a Cloud
+  Hypervisor `vm.snapshot` (config.json + memory-ranges + state.json),
+  and leaves it stopped. The master is **never consumed or modified** —
+  every default-spec create can restore from it, run after run.
+  A adopting VM gets its own directory with: a `cp --reflink=auto`
+  copy of the master's disk (instant on a reflink fs — CH 53's qcow2
+  parser rejects backing chains, so a real copy is the only option; it
+  falls back to a plain copy elsewhere), a per-VM snapshot built by
+  **hard-linking** the master's memory-ranges (read-only during a
+  restore, so zero cost) and copying + path-patching the two small JSON
+  files, a fresh config disk, and its own (IP, MAC) from the pool. The
+  first boot is a bare-VMM `vm.restore` in **Copy** mode (measured
+  faster than OnDemand here: 1.45 s vs 2.71 s to ssh with a warm
+  snapshot file), then the guest is **renumbered** over ssh — the
+  restored memory still carries the master's baked-in address, so the
+  new MAC + IP are applied, the master's address is deleted, and the
+  default route (flushed by the link-down) is re-added. Because every
+  restored guest shares the master's (IP, MAC) until it is renumbered,
+  concurrent adopts are serialized by `master-adopt.lock` from the
+  restore until the VM's own IP is up. Resumes of an adopted VM are
+  ordinary cold boots from its own disk (the disk has diverged — the
+  snapshot is first-boot only), and the renumbering survives the reboot
+  because the VM's config disk carries the same (IP, MAC). Two rules the
+  implementation depends on: **the master must be a *created* template,
+  never a resumed one** (a snapshot of a resumed VM restores into zeroed
+  memory — 204, running vCPUs, dead guest), and the quiesce before the
+  snapshot is mandatory (a mid-boot snapshot makes the restore re-run the
+  rest of the boot, an 8 G page-in storm that OOM-killed CH on a small
+  host). Any non-default spec, or a failed/absent master, is a normal
+  cold boot. The shared mount needs no guest agent: virtiofs survives
+  the virtiofsd rebind (a fresh virtiofsd on the same socket path before
+  the restore is enough).
 - **Direct kernel boot** — no UEFI, no GRUB: CH loads the kernel +
   initramfs straight from the baked assets (~5–8 s faster than a firmware
   boot). The console is a virtio-console (`hvc0`); `pi-vm logs` shows the
   kernel boot messages. Missing/stale assets → `create`/`resume` fail
   preflight (exit 2) with a pointer at `pi-vm bake`.
-- **Boot speed** — fresh VM to ssh-ready: median ~25 s (min ~16 s) on a
-  2-vCPU nested-KVM host; 5/5 benchmark runs reach ssh, every stop clean.
-  On a normal host it lands near the min. Benchmark on your host with
-  `tools/bench-boot.sh` (5 runs, min/median/avg/stddev/max; `--warmup` for
-  a cold first run).
+- **Boot speed** — measured with `e2e.sh` (the functional gate, prints a
+  `boot timing` line per boot) and `profile-boot.sh` (host context + the
+  guest's systemd breakdown). Same-window medians, cold vs master
+  adoption: on a bare-metal 8-core/61 G host a cold create is ~7.5 s
+  (guest 6.9 s: kernel 0.46 + initrd 2.28 + userspace-to-ssh ~4.2); on a
+  4-vCPU/7.7 G nested-KVM box a cold boot is 15–23 s and an adoption
+  9.1–9.5 s vs 15.6–17.2 s cold in the same window. Host drift is ±30 %
+  over hours on a small host, so only compare numbers from one run.
 
 ## FAQ
 
@@ -277,8 +302,16 @@ pi-vm version           CLI + CH versions, image hashes
   (ENOKEY) — observed on pi session-file creation. Workaround: put the
   shared folder on the VM's local disk (e.g. /tmp) for nested use.
 - virtiofsd lives in `/usr/libexec` on Fedora (not in PATH).
-- The guest's root partition/fs grow to `--disk` on first boot via the
-  cloud image's growpart/resizefs (the base is 5G virtual).
+- The base image's root partition + fs are **pre-grown to 100 G at bake
+  time** (the default `--disk`), so a default create does no grow work.
+  A smaller `--disk` does NOT shrink the virtual disk (a truncated qcow2
+  makes the 100 G btrfs unmountable) — the disk keeps the base's virtual
+  size (sparse, no storage cost) and the baked `pi-vm-net` unit shrinks
+  the *fs* online to the requested size on first boot.
+- On a non-root host, privileged steps (bridge/TAP/iptables) go through
+  `sudo`. `create`/`resume`/`bake`/`install` prime the sudo lease at
+  start so the password prompt never lands inside a measured boot phase
+  (it used to inflate `net+tap` by however long you took to type).
 
 ## TODO
 
@@ -345,7 +378,8 @@ Resume maybe does pi -r
 - possible performance improvements:
   - do network setup and ch start in parallel
   - slim kernel for faster CH boot
-  - sudo improvements to not pause part way through boot (mentioned earlier)
+  - sudo improvements to not pause part way through boot (mentioned
+    earlier) — done: the sudo lease is primed once at command start
   - fix the qcow refcount thing that might already be fixed
 
 - rm on stopped vm sometimes records as running
@@ -368,6 +402,10 @@ Migration Protocol Versions: 0
 cloud image sha256 28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f
 pre-baked image sha256 263a01e3fa6fbb4ed9ce92514e1c3b959debeb42f89759f3cc578ef5b0d403de
 ```
+
+terminal title isnt working 
+
+
 ## Data layout
 
 ```
@@ -376,7 +414,14 @@ pre-baked image sha256 263a01e3fa6fbb4ed9ce92514e1c3b959debeb42f89759f3cc578ef5b
                      (direct-boot assets, from `bake`)
   images/            fedora44-cloud.qcow2, fedora44-cloud-prepped.qcow2
   vms/<12-hex-id>/   meta.json, disk.qcow2, config.raw, console.log, .lock
-  network.conf     the chosen VM /24 pool + gateway (persists across runs)
+                     (an adopting VM also has snapshot/ — its own
+                      config.json/state.json + hard-linked memory-ranges)
+  vms/dead00000001/  the snapshot master (warm-default; `pi-vm rm` it
+                     only if you intend to re-bake)
+  snapshots/default/ the master snapshot (config.json, memory-ranges,
+                     state.json) — never modified by an adopter
+  master-adopt.lock  serializes concurrent adoptions (restore -> own IP)
+  network.conf       the chosen VM /24 pool + gateway (persists across runs)
 ```
 
 Per-VM folder + meta.json (no database): the folder is the source of truth;

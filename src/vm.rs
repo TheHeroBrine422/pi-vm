@@ -84,23 +84,6 @@ pub struct VmConfig {
 }
 
 /// Create a new VM: id, meta, ssh key, disk copy + resize.
-/// The TAP name a snapshot restore expects: CH re-opens the tap named in
-/// the snapshot's config.json (the template's tap — not the adopter's
-/// fresh one), so the host must prepare that exact name.
-fn snapshot_tap_name(home: &VmHome) -> String {
-    let path = home.snapshot_dir("default").join("config.json");
-    if let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-    {
-        for item in v.get("net").and_then(|n| n.as_array()).into_iter().flatten() {
-            if let Some(tap) = item.get("tap").and_then(|t| t.as_str()) {
-                return tap.to_string();
-            }
-        }
-    }
-    format!("tap-{}", &state::WARM_ID[..8])
-}
-
 pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     // preflight
     if let Some(p) = &cfg.project
@@ -154,48 +137,67 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
     };
     let now = state::now();
 
-    // Snapshot-pool adoption: a default-spec create (4 vCPU / 8 G /
-    // 100 G — the pi-vm defaults) adopts the bake-time template VM:
-    // its first boot is a CH restore (~1 s to ssh) instead of a cold
-    // boot. The template's (IP, MAC) are fixed (the snapshot bakes
-    // them in), so the adopter reuses them; the adoption overwrites
-    // the template's meta.json in its directory (the pool slot is
-    // single-use — the next bake rebuilds it).
-    if cfg.vcpus == 4 && cfg.memory_mb == 8192 && cfg.disk_gb == 100 {
-        if let Ok(w) = VmMeta::load(home, state::WARM_ID)
-            && w.name.as_deref() == Some("warm-default")
-            && w.state == VmState::Stopped
+    // Master snapshot adoption: a default-spec create (4 vCPU / 8 G /
+    // the master's disk size) restores the bake-time master snapshot.
+    // The master (meta + disk + snapshot) is NEVER modified: the adopter
+    // gets its own directory, an instant qcow2 copy-on-write layer on
+    // the master disk, a fresh config disk, and its own (IP, MAC) from
+    // the pool. Its first boot is a CH restore; right after the restore
+    // it is renumbered over ssh (the master's IP is baked into the
+    // restored memory). Any other spec falls through to the cold path.
+    if cfg.vcpus == 4 && cfg.memory_mb == 8192
+        && let Ok(w) = VmMeta::load(home, state::WARM_ID)
+        && w.name.as_deref() == Some("warm-default")
+        && w.state == VmState::Stopped
+        && cfg.disk_gb == w.disk_gb
+        && home.snapshot_dir("default").join("state.json").exists()
+    {
+        let dir = home.vms_dir().join(&id);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        // Disk = a per-VM copy of the master's disk (never modified).
+        // CH 53's qcow2 parser rejects backing chains (MaxNestingDepth),
+        // so a layer is out; `cp --reflink=auto` is ~0.1 s on a
+        // reflink fs (this host is btrfs) and falls back to a plain
+        // copy elsewhere (2.3 G sparse ≈ 1–2 s).
+        let master_disk = w.vm_dir(home).join("disk.qcow2");
+        let disk = dir.join("disk.qcow2");
+        if run("cp", &["--reflink=auto", master_disk.to_str().unwrap(), disk.to_str().unwrap()]).is_err()
+            && run("cp", &[master_disk.to_str().unwrap(), disk.to_str().unwrap()]).is_err()
         {
-            let meta = VmMeta {
-                id: id.clone(),
-                name: cfg.name.clone(),
-                created: now,
-                updated: now,
-                project: cfg.project.clone(),
-                subnet: pool,
-                ip: w.ip,
-                mac: w.mac,
-                vcpus: cfg.vcpus,
-                memory_mb: cfg.memory_mb,
-                disk_gb: cfg.disk_gb,
-                kvm: cfg.kvm,
-                squash_uid: squash,
-                base_image_sha256,
-                state: VmState::Stopped,
-                ch_pid: None,
-                net_gen: Some(3),
-                snapshot: true,
-                vm_dir_override: Some(state::WARM_ID.to_string()),
-            };
-            // Overwrite the template's meta in its (fixed) directory.
-            meta.save(home)?;
-            println!(
-                "   created VM {} {} (pool adoption — first boot is a snapshot restore)",
-                meta.id,
-                meta.name.as_deref().unwrap_or("(no name)")
-            );
-            return Ok(meta);
+            return Err("cp of the master disk failed (see the log above)".into());
         }
+        let meta = VmMeta {
+            id: id.clone(),
+            name: cfg.name.clone(),
+            created: now,
+            updated: now,
+            project: cfg.project.as_ref().map(|p| {
+                std::fs::canonicalize(p)
+                    .map(|c| c.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| p.clone())
+            }),
+            subnet: pool,
+            ip,
+            mac,
+            vcpus: cfg.vcpus,
+            memory_mb: cfg.memory_mb,
+            disk_gb: cfg.disk_gb,
+            kvm: cfg.kvm,
+            squash_uid: squash,
+            base_image_sha256,
+            state: VmState::Stopped,
+            ch_pid: None,
+            net_gen: Some(3),
+            snapshot: true,
+        };
+        meta.save(home)?;
+        write_config_disk(home, &meta, &hn)?;
+        println!(
+            "   created VM {} {} (master adoption — first boot is a snapshot restore)",
+            meta.id,
+            meta.name.as_deref().unwrap_or("(no name)")
+        );
+        return Ok(meta);
     }
     let meta = VmMeta {
         id: id.clone(),
@@ -220,7 +222,6 @@ pub fn create_vm(home: &VmHome, cfg: &VmConfig) -> Result<VmMeta, String> {
         ch_pid: None,
         net_gen: Some(3),
         snapshot: false,
-        vm_dir_override: None,
     };
     let dir = meta.vm_dir(home);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -387,14 +388,33 @@ fn attach_title_prefix(meta: &VmMeta) -> Option<String> {
 /// deletion itself happens in the caller, after the lock is released).
 pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
            timeout_s: Option<u64>, rm: bool) -> Result<i32, BootFail> {
+    crate::util::prime_sudo(); // before any timing: a stale sudo lease must not prompt inside the measured window
     let boot_start = std::time::Instant::now();
     let deadline = timeout_s
         .map(|s| boot_start + Duration::from_secs(s));
     if let Some(t) = timeout_s {
         println!("   timeout: the VM stops {t}s after launch");
     }
-    let _lock = state::VmLock::acquire(&meta, home)
-        .map_err(BootFail::InUse)?;
+    // The resume case: the previous stop may still be finishing (the
+    // meta says stopped, the supervisor still holds the flock while the
+    // guest powers off). Wait it out (up to 120 s); a RUNNING meta with
+    // a held lock is a genuine contention — fail fast.
+    let _lock = {
+        let mut attempt = 0u32;
+        loop {
+            match state::VmLock::acquire(&meta, home) {
+                Ok(l) => break l,
+                Err(_e) if attempt < 60 && meta.state == VmState::Stopped => {
+                    if attempt == 0 {
+                        println!("   waiting for the in-flight stop to finish (lock held) ...");
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                    attempt += 1;
+                }
+                Err(e) => return Err(BootFail::InUse(e)),
+            }
+        }
+    };
     let t_lock = boot_start.elapsed().as_secs_f64();
 
     // VMs created by an older pi-vm (legacy per-VM /24 + NoCloud ISO, the
@@ -448,11 +468,7 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     // Shared bridge serves every VM; this VM gets its own TAP + a static
     // pool IP (written to the config disk by create_vm).
     ensure_shared_network(home).map_err(BootFail::Preflight)?;
-    let tap = if meta.snapshot {
-        snapshot_tap_name(home)
-    } else {
-        meta.tap_name()
-    };
+    let tap = meta.tap_name();
     if !run_ok_priv("ip", &["link", "show", &tap]) {
         run_priv("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
             .map_err(BootFail::Preflight)?;
@@ -625,11 +641,43 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     let t_chspawn = ch_spawned_at.duration_since(boot_start).as_secs_f64();
 
     // Snapshot-pool adoption: wait for the VMM's API socket, then
-    // restore (OnDemand paging + immediate resume). The VM comes up
+    // restore (Copy memory mode + immediate resume). The VM comes up
     // mid-run: sshd + the network + (if re-bound before the restore —
     // the virtiofsd above) /workspace are all already established.
     let snapshot_restore = meta.snapshot;
+    // Where the adoption time goes, for the boot timing line (None on the
+    // cold path). Declared here because the restore block fills it.
+    let mut restore_timing: Option<String> = None;
     if snapshot_restore {
+        // Per-VM snapshot built from the NEVER-modified master snapshot:
+        // memory-ranges is hard-linked (read-only during a restore — zero
+        // cost on any fs; a full copy is the fallback), the two small
+        // JSON files are copied and path-patched (disk/console/fs.sock/
+        // config.raw -> this VM's dir; tap + MAC -> this VM's).
+        let master = VmMeta::load(home, state::WARM_ID)
+            .map_err(|e| BootFail::Preflight(format!("master meta lost before restore: {e}")))?;
+        let mdir_s = master.vm_dir(home).display().to_string().replace('\\', "/");
+        let vdir_s = meta.vm_dir(home).display().to_string().replace('\\', "/");
+        let (m_tap, v_tap) = (master.tap_name(), meta.tap_name());
+        let (m_mac, v_mac) = (master.mac.clone(), meta.mac.clone());
+        let (msnap, vsnap) = (home.snapshot_dir("default"), meta.vm_dir(home).join("snapshot"));
+        std::fs::create_dir_all(&vsnap)
+            .map_err(|e| BootFail::Preflight(format!("create {}: {e}", vsnap.display())))?;
+        if std::fs::hard_link(msnap.join("memory-ranges"), vsnap.join("memory-ranges")).is_err() {
+            run("cp", &[
+                "--reflink=auto",
+                msnap.join("memory-ranges").to_str().unwrap(),
+                vsnap.join("memory-ranges").to_str().unwrap()
+            ])
+            .map_err(BootFail::Preflight)?;
+        }
+        for name in ["config.json", "state.json"] {
+            let text = std::fs::read_to_string(msnap.join(name))
+                .map_err(|e| BootFail::Preflight(format!("read {name}: {e}")))?;
+            let patched = text.replace(&mdir_s, &vdir_s).replace(&m_tap, &v_tap).replace(&m_mac, &v_mac);
+            std::fs::write(vsnap.join(name), patched)
+                .map_err(|e| BootFail::Preflight(format!("write {name}: {e}")))?;
+        }
         let sd = std::time::Instant::now() + Duration::from_secs(20);
         while !api_sock.exists() {
             if ch_child.try_wait().ok().flatten().is_some() {
@@ -640,10 +688,22 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
             }
             thread::sleep(Duration::from_millis(20));
         }
-        let snap = home.snapshot_dir("default");
+        // Serialize the adoption: every restored guest shares the master's
+        // (IP, MAC) in memory until it is renumbered, and two such guests
+        // on one bridge make the pre-renumbering ssh ambiguous. The lock
+        // is held from the restore call until the VM's own IP is up
+        // (flock releases on drop / process exit).
+        use fs2::FileExt as _;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(home.root.join("master-adopt.lock"))
+            .map_err(|e| BootFail::Preflight(format!("open master-adopt.lock: {e}")))?;
+        lock.lock_exclusive().map_err(|e| BootFail::Preflight(format!("master-adopt.lock: {e}")))?;
+        let t_adopt_lock = boot_start.elapsed().as_secs_f64();
         let body = format!(
-            "{{\"source_url\":\"file://{}\",\"memory_restore_mode\":\"OnDemand\",\"resume\":true}}",
-            snap.display().to_string().replace('\\', "/")
+            "{{\"source_url\":\"file://{}\",\"memory_restore_mode\":\"Copy\",\"resume\":true}}",
+            vsnap.display().to_string().replace('\\', "/")
         );
         let (st, resp) = match api_put_unix(&api_sock, "/api/v1/vm.restore", &body) {
             Ok(r) => r,
@@ -655,7 +715,41 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
                 resp.lines().last().unwrap_or("").chars().take(200).collect::<String>()
             )));
         }
-        println!("   snapshot restore (ondemand) — the VM resumes mid-run");
+        println!("   snapshot restore (copy mode) — renumbering to {} ...", meta.ip);
+        let t_restore = boot_start.elapsed().as_secs_f64();
+        if !wait_ssh_ready(&master.ip, 30) {
+            return Err(BootFail::BootFailed(format!(
+                "the restored VM never came up at the master's IP ({}) — see console.log",
+                master.ip
+            )));
+        }
+        let t_master = boot_start.elapsed().as_secs_f64();
+        if let Err(e) = renumber_guest(&master.ip, &meta.ip, &meta.subnet, &meta.mac) {
+            return Err(BootFail::BootFailed(format!("post-restore renumbering failed: {e}")));
+        }
+        if !wait_ssh_ready(&meta.ip, 30) {
+            return Err(BootFail::BootFailed(format!(
+                "the VM never came up at its own IP ({}) after renumbering — see console.log \
+                 and /tmp/pi-vm-renumber.log in the guest (resume it to read the log)",
+                meta.ip
+            )));
+        }
+        println!(
+            "   renumbered {} -> {} (master untouched; this VM is now at its own IP)",
+            master.ip, meta.ip
+        );
+        // The phases the [supervisor]/[guest] split cannot see:
+        // adopt-lock = waiting for a concurrent adopter; restore = the
+        // 204 (Copy reads the memory file — page-cache bound);
+        // master-ssh = the restored guest answering the master's IP;
+        // renumber = applying the new (IP, MAC) + the guest answering
+        // its own IP.
+        let t_own = boot_start.elapsed().as_secs_f64();
+        restore_timing = Some(format!(
+            "adopt-lock {:.2}s, restore {:.2}s, master-ssh {:.2}s, renumber {:.2}s",
+            t_adopt_lock - t_chspawn, t_restore - t_adopt_lock,
+            t_master - t_restore, t_own - t_master
+        ));
     }
 
     // record running state
@@ -737,7 +831,11 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     println!();
     if !ready {
         if interrupted.load(Ordering::Relaxed) || terminated.load(Ordering::Relaxed) {
-            eprintln!("interrupted — tearing down");
+            eprintln!(
+                "interrupted — tearing down (int={} term={})",
+                interrupted.load(Ordering::Relaxed),
+                terminated.load(Ordering::Relaxed)
+            );
             teardown(home, &meta, &mut ch_child, &mut vfs_child, &api_sock, rm);
             return Err(BootFail::Interrupted("interrupted before ssh became reachable".into()));
         }
@@ -753,8 +851,9 @@ pub fn boot(home: &VmHome, meta: VmMeta, attach: bool, shell: bool,
     // the guest journal / `systemd-analyze` on the VM).
     let preflight = ch_spawned_at.duration_since(boot_start).as_secs_f64();
     let guest_boot = std::time::Instant::now().duration_since(ch_spawned_at).as_secs_f64();
-    println!("   boot timing: [supervisor] lock {:.2}s, net+tap {:.2}s, virtiofsd {:.2}s, ch-spawn {:.2}s | [guest] {:.1}s (ch-spawn -> ssh-ready), total {:.1}s",
-        t_lock, t_net - t_lock, t_vfsd - t_net, t_chspawn - t_vfsd, guest_boot, preflight + guest_boot);
+    println!("   boot timing: [supervisor] lock {:.2}s, net+tap {:.2}s, virtiofsd {:.2}s, ch-spawn {:.2}s | [guest] {:.1}s (ch-spawn -> ssh-ready), total {:.1}s{}",
+        t_lock, t_net - t_lock, t_vfsd - t_net, t_chspawn - t_vfsd, guest_boot, preflight + guest_boot,
+        restore_timing.as_ref().map(|s| format!(" | [restore] {s}")).unwrap_or_default());
 
     // --- attach or foreground-wait ---
     // `attach_failed`: the attach ssh session did not run normally (spawn
@@ -1437,6 +1536,111 @@ pub fn api_put_unix(socket: &std::path::Path, path: &str, body: &str) -> Result<
     Ok((status, text))
 }
 
+/// Probe a VM's ssh (tcp open + a `true` round-trip) on a 200 ms cadence
+/// for up to `cap_s` seconds. Used by the master-adoption renumbering
+/// (wait for the master's baked-in IP, then the VM's own IP).
+pub fn wait_ssh_ready(ip: &str, cap_s: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cap_s);
+    loop {
+        if tcp_open(ip, 22)
+            && Command::new("ssh")
+                .args(ssh_opts())
+                .arg(format!("root@{ip}"))
+                .arg("true")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// The renumbering command, built separately so the single-quote
+/// invariant (see renumber_guest) is unit-testable.
+fn renumber_cmd(pre_ip: &str, new_ip: &str, subnet: &str, new_mac: &str) -> String {
+    let prefix = subnet.rsplit('/').next().unwrap_or("24");
+    // The pool gateway = the subnet base with last octet .1 (host_net's
+    // gateway is always that; both the master and the VM live in the
+    // same pool /24).
+    let gw = subnet
+        .split('/')
+        .next()
+        .map(|base| {
+            let o: Vec<&str> = base.split('.').collect();
+            if o.len() == 4 {
+                format!("{}.{}.{}.1", o[0], o[1], o[2])
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
+    // Interface = whatever currently carries the master's address; the
+    // fallback (the default route's device) covers a flushed address —
+    // at this point the restored route table is still the snapshot's.
+    let inner = format!(
+        "IF=$(ip -o -4 addr show | grep -F {pre_ip}/ | head -1 | sed -E \"s/^[0-9]+: ([^ ]+).*/\\1/\"); \
+         [ -n \"$IF\" ] || IF=$(ip route show default | sed -E \"s/.* dev ([^ ]+).*/\\1/\" | head -1); \
+         [ -n \"$IF\" ] || exit 7; \
+         ip link set dev $IF down && \
+         ip link set dev $IF address {new_mac} && \
+         ip link set dev $IF up && \
+         ip addr del {pre_ip}/{prefix} dev $IF 2>/dev/null; \
+         ip addr replace {new_ip}/{prefix} dev $IF && \
+         ip route replace default via {gw}"
+    );
+    format!("setsid bash -c '{inner}' >/tmp/pi-vm-renumber.log 2>&1 </dev/null &")
+}
+
+/// Move a freshly restored guest from the master's baked-in (IP, MAC)
+/// to the VM's own (the gateway is unchanged — same /24 pool): set the
+/// new MAC + IP on the uplink, delete the baked-in IP, and re-add the
+/// default route.
+///
+/// Three empirically-verified traps:
+/// - the link-down FLUSHES the gateway route (the kernel drops routes
+///   via a downed link) — the snapshot's default route does not survive
+///   it, so the route is re-added after the up (missing it = no internet
+///   for the adopted VM, ssh still works: the on-link route is enough);
+/// - `ip addr replace` ADDS without removing other addresses of the same
+///   prefix — the baked-in IP stays primary and pins the connected
+///   route's src to the stale address (and leaves two restored guests
+///   answering the master's IP at once) — so the old address is deleted
+///   explicitly;
+/// - deleting that address kills the ssh session CARRYING the command
+///   (its source address disappears — a black-holed TCP session, and
+///   ConnectTimeout does not bound an established one). So the script
+///   runs DETACHED (setsid + redirected stdio): ssh returns immediately
+///   and success is verified by the caller waiting for new_ip. An
+///   attached run hangs forever; the failure log stays in the guest at
+///   /tmp/pi-vm-renumber.log.
+///
+/// The inner script must contain NO single quotes (it is passed inside a
+/// single-quoted bash -c). The later cold resume re-reads the VM's config
+/// disk, which carries the same (IP, MAC), so the renumbering survives
+/// reboots.
+fn renumber_guest(pre_ip: &str, new_ip: &str, subnet: &str, new_mac: &str) -> Result<(), String> {
+    let cmd = renumber_cmd(pre_ip, new_ip, subnet, new_mac);
+    let out = Command::new("ssh")
+        // keepalives: a black-holed session must never stall the
+        // supervisor (the detach above makes this belt-and-braces)
+        .args(["-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=2"])
+        .args(ssh_opts())
+        .arg(format!("root@{pre_ip}"))
+        .arg(&cmd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("renumbering ssh launch failed: {}",
+            String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()));
+    }
+    Ok(())
+}
+
 /// ssh options for talking to a VM's guest — the single source of truth
 /// for every ssh connection this tool makes (boot probe, attach,
 /// graceful poweroff, `pi-vm attach`): the host user's DEFAULT ssh key
@@ -1542,14 +1746,20 @@ const SIGTSTP_HINT: &str = "Ctrl-Z ignored while attached — the VM stays up; u
 /// turn into the hint — the default suspend action is replaced, so Ctrl-Z
 /// no longer hangs the session.
 fn install_signal_handler(interrupted: Arc<AtomicBool>, terminated: Arc<AtomicBool>, tstp: Arc<AtomicBool>) {
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted);
+    // SIGINT is only honored on a tty: a non-interactive supervisor (e2e
+    // gate, background run) must ignore stray group signals — they are
+    // noise, not user intent. SIGTERM (stop) and SIGTSTP (Ctrl-Z hint)
+    // are always honored.
+    if std::io::stdin().is_terminal() {
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted);
+    }
     let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, terminated);
     let _ = signal_hook::flag::register(signal_hook::consts::SIGTSTP, tstp);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_title, qemu_img_info_cleanly_closed};
+    use super::{attach_title, qemu_img_info_cleanly_closed, renumber_cmd};
     use crate::state::{VmHome, VmMeta, VmState};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1576,7 +1786,6 @@ mod tests {
             ch_pid: None,
             net_gen: Some(2),
         snapshot: false,
-        vm_dir_override: None,
         }
     }
 
@@ -1584,6 +1793,26 @@ mod tests {
     /// validly-closed disk: `qemu-img info` prints "cleanly shut down: no"
     /// only for a dirty image (a clean one gets no such line), so the
     /// absence of the line means cleanly closed.
+    /// The renumbering runs inside a single-quoted `bash -c`, so the
+    /// inner script must carry no single quotes, and it must be DETACHED
+    /// (the command deletes the ssh session's own source address — see
+    /// renumber_guest) and must restore the default route the link-down
+    /// flushed.
+    #[test]
+    fn renumber_cmd_is_quote_safe_and_detached() {
+        let c = renumber_cmd("172.16.9.114", "172.16.9.22", "172.16.9.0/24", "52:54:00:11:22:33");
+        // exactly two single quotes: the bash -c wrapper itself
+        assert_eq!(c.matches('\'').count(), 2, "inner script leaked a quote: {c}");
+        assert!(c.starts_with("setsid bash -c '") && c.ends_with("</dev/null &"));
+        assert!(c.contains("ip link set dev $IF address 52:54:00:11:22:33"));
+        assert!(c.contains("ip addr del 172.16.9.114/24 dev $IF"));
+        assert!(c.contains("ip addr replace 172.16.9.22/24 dev $IF"));
+        assert!(c.contains("ip route replace default via 172.16.9.1"));
+        // the link-down flushes the gateway route — re-adding it is the
+        // difference between an adopted VM with and without internet
+        assert!(c.contains("ip route replace default"));
+    }
+
     #[test]
     fn qemu_img_info_cleanly_closed_check() {
         // clean: no clean-state line at all (the qemu 8.2+ format)

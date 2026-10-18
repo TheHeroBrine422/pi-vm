@@ -23,6 +23,7 @@ pub struct Install {}
 
 impl Install {
     pub fn run(&self, home: &VmHome) -> i32 {
+        crate::util::prime_sudo();
         let pm = if run_ok("which", &["dnf"]) { Some("dnf") } else { None };
         if !self.requirements(pm) {
             eprintln!();

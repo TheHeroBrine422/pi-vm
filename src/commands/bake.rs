@@ -93,6 +93,7 @@ impl Drop for Cleanup {
 
 impl Bake {
     pub fn run(&self, home: &VmHome) -> i32 {
+        crate::util::prime_sudo();
         // --- arguments / preflight ---
         let pi_dir = match self.resolve_pi_dir() {
             Some(p) => p,
@@ -595,7 +596,6 @@ impl Bake {
             state: crate::state::VmState::Stopped, ch_pid: None,
             net_gen: Some(3),
         snapshot: false,
-        vm_dir_override: None,
         };
         match crate::vm::allocate_ip(home, &hn.pool) {
             Ok(ip) => meta.ip = ip,
@@ -627,6 +627,30 @@ impl Bake {
                         .map(|o| o.status.success())
                         .unwrap_or(false)
                 {
+                    // Quiesce: ssh-ready fires before systemd settles on a
+                    // slow host — a mid-boot snapshot makes the restore
+                    // re-run the rest of the boot (an 8 G page-in storm
+                    // that OOM-killed CH on a small host). Wait for all
+                    // units to settle, then an idle period.
+                    let mut settled = false;
+                    let mut last = String::new();
+                    for _ in 0..24 {
+                        last = std::process::Command::new("ssh")
+                            .args(crate::vm::ssh_opts())
+                            .arg(format!("root@{sip}"))
+                            .arg("systemctl is-system-running")
+                            .output()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                            .unwrap_or_default();
+                        if last == "running" || last == "degraded" { settled = true; break; }
+                        std::thread::sleep(std::time::Duration::from_secs(10));
+                    }
+                    if !settled {
+                        eprintln!("   WARN: is-system-running never settled ({last}) — snapshot anyway");
+                    } else {
+                        eprintln!("   warm: system settled — 90 s quiesce before the snapshot");
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(90));
                     // CH 53 writes the snapshot into an EXISTING directory;
                     // a pause attempt first (the prototype snapshot 204ed
                     // even after a failed pause — ignore the result).
@@ -645,7 +669,16 @@ impl Bake {
                         match crate::vm::api_put_unix(&sock, "/api/v1/vm.snapshot", body) {
                             Ok((st, resp)) => {
                                 Self::append_data("/tmp/warm-snap-attempts.log", &format!("attempt {attempt}: HTTP {st} {resp}\n"));
-                                if st == 204 { ok = true; break; }
+                                if st == 204 {
+                                    // Pre-warm the snapshot's memory file into
+                                    // the page cache (the restore reads it;
+                                    // one-time, best-effort).
+                                    let _ = std::process::Command::new("dd")
+                                        .args(["if=/tmp/warm-snap/memory-ranges", "of=/dev/null", "bs=1M"])
+                                        .output();
+                                    ok = true;
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 Self::append_data("/tmp/warm-snap-attempts.log", &format!("attempt {attempt}: {e}\n"));
@@ -659,7 +692,7 @@ impl Bake {
             }
             let _ = tx.send(false);
         });
-        match crate::vm::boot(home, meta, false, false, Some(90), false) {
+        match crate::vm::boot(home, meta, false, false, Some(240), false) {
             Ok(0) => {}
             _ => {
                 eprintln!("   WARN: warm template boot failed — no pool (all creates cold)");
@@ -691,7 +724,7 @@ impl Bake {
                 return;
             }
         }
-        println!("   snapshot pool ready (default spec 4 vCPU / 8 G / 100 G: the next default create adopts it — first boot is a restore)");
+        println!("   snapshot master ready (default spec 4 vCPU / 8 G / 100 G: every default create restores it — the master is never consumed)");
     }
 
     fn warm_cleanup(&self, home: &VmHome) {
