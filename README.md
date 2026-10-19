@@ -89,12 +89,21 @@ pi-vm [create] [path] [--name N] [--vcpus 4] [--memory 8192] [--disk 100]
                          (disk + state + network) instead of leaving it
                          stopped; a failed boot or a failed attach does
                          not delete it
-pi-vm resume <id|name> [--shell]
-           [--timeout N] [--rm]
+pi-vm resume <id|name> [--vcpus N] [--memory MB]
+           [--shell] [--timeout N] [--rm]
                          boot an existing VM and attach; --rm deletes
                          the VM when it stops normally (the attach
                          session ends, or --timeout fires) instead of
                          leaving it stopped
+                         --vcpus N / --memory MB: boot with a different
+                         spec than recorded (a resume is a cold boot
+                         from the VM's disk — the disk carries no spec,
+                         so this is just a different CH launch on the
+                         same disk). A change is recorded: later plain
+                         resumes keep the new spec. A never-booted
+                         adopted VM's first boot is still the master's
+                         restore (the snapshot bakes the topology in);
+                         the override applies from its second boot
 pi-vm attach <id|name>
                          attach a plain shell to a running VM (not the
                          pi session); the VM keeps running when you exit
