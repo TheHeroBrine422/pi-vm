@@ -2,5 +2,7 @@ target
 /pi/*
 !/pi/.gitkeep
 !/pi/AGENTS.md
+!/pi/settings.json.example
+!/pi/web-search.json.example
 pi-vm-autoresearch/
 .pi/

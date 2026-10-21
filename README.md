@@ -9,7 +9,9 @@ project.
 ## Layout
 
 ```
-pi/         pi config
+pi/         pi config (local-only — git-ignored; the tracked standard
+            templates are pi/settings.json.example +
+            pi/web-search.json.example)
 src/        the pi-vm CLI (Rust)
 docs/       forwarding.md (reaching private/remote services from a VM)
 ```
@@ -30,6 +32,7 @@ Requirements:
 ```
 cargo install --path .
 pi-vm install
+cp pi/settings.json.example pi/   # once: the standard pi config (local-only; git-ignored)
 pi-vm bake
 ```
 
@@ -56,6 +59,17 @@ pi-vm bake [--pi-dir D] [--ssh-key F] [--timeout N]
                          full toolchain + your ssh pubkey + direct-boot
                          kernel assets) — the VM equivalent of a
                          container image's build-time COPY
+                         Pi packages come from the pi config's
+                         settings.json `packages` (the array pi itself
+                         uses): npm/git/URL specs are installed into the
+                         image at bake time; local paths (relative to the
+                         pi config dir) are baked in as-is — a
+                         `packages/` folder next to settings.json is the
+                         natural home for local pi packages. A missing
+                         local path aborts the bake before the prep boot.
+                         Fresh clone: `cp pi/settings.json.example pi/`
+                         first (without a settings.json the bake warns and
+                         ships an image with no pi packages).
                          --ssh-key F: the host pubkey to bake into the
                          image (the guest's root trusts the host user's
                          ssh key; default: ~/.ssh/*.pub, which must
@@ -169,7 +183,8 @@ pi-vm version           CLI + CH versions, image hashes
   burning the ssh timeout.
 - **Pre-baked base image** — `pi-vm bake` builds the base image: Fedora 44
   cloud + your pi config + the full toolchain (git, ripgrep, fd, node,
-  python3, cargo/rust, uv, docker + compose, latest pi +
+  python3, cargo/rust, uv, docker + compose, latest pi + the pi packages
+  from the pi config's `packages` setting — default config bakes
   pi-web-access + pi-subagents + pi-goal-x) + your ssh pubkey + the
   direct-boot kernel assets. New VMs boot ready — no first-boot
   install. The per-boot `pi-vm-net` unit (config-disk network read,
@@ -290,7 +305,7 @@ pi-vm version           CLI + CH versions, image hashes
 - better ways to deal with long lasting commands. we likely need to see if pi can force commands to have a max timeout of lets say 10 minutes and never let the LLM do a timeout higher then that. maybe even 5 minutes tbh
 - maybe a shortcut for --no-mount for just asking quick questions
 - possibly add forwarding commands as a separate sub command that inserts the info about it into an agent's session and allows me to just run one extra command rather then dealing with all of it manually
-- ability to set extensions to be baked into the image as a setting for pi-vm rather then it being hard coded
+- ability to set extensions to be baked into the image as a setting for pi-vm rather then it being hard coded — done: `bake` reads the pi config's `packages` setting (npm/git/URL specs installed at bake time; local paths baked as-is, validated before the prep boot)
 - have install check for cloud-hypervisor binaries on PATH and other assets before downloading to have better compatibility with other install methods (ex: rpm spec)
   - related: make install not reliant on dnf.
 - possibly keep older versions of the baked image and add a `pi-vm images` command?

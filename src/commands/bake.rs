@@ -16,7 +16,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,6 +101,26 @@ impl Bake {
                 return 2;
             }
         };
+        let packages = match resolve_bake_packages(&pi_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        };
+        for w in &packages.warnings {
+            println!("   warning: {w}");
+        }
+        if !packages.installs.is_empty() || !packages.locals.is_empty() {
+            let mut parts = Vec::new();
+            if !packages.installs.is_empty() {
+                parts.push(format!("{} remote ({})", packages.installs.len(), packages.installs.join(", ")));
+            }
+            if !packages.locals.is_empty() {
+                parts.push(format!("{} local ({})", packages.locals.len(), packages.locals.join(", ")));
+            }
+            println!("   packages: {}", parts.join(", "));
+        }
         let pubkey = match self.resolve_ssh_pubkey() {
             Some(p) => p,
             None => return 2,
@@ -180,7 +200,7 @@ impl Bake {
             eprintln!("error: {e}");
             return 2;
         }
-        std::fs::write(nocloud.join("user-data"), user_data())
+        std::fs::write(nocloud.join("user-data"), user_data(&packages.installs))
             .expect("write user-data");
         if let Err(e) = run(
             "genisoimage",
@@ -648,7 +668,125 @@ fn api_shutdown(api_sock: &std::path::Path) -> bool {
 /// written as a normal multi-line shell script and concatenated to the
 /// one-line `bash -c '...'` entry by `runcmd_block` (YAML plain scalar:
 /// no `: `, no single quotes).
-fn user_data() -> String {
+/// The pi packages to bake, read from the pi config's `settings.json`
+/// `packages` (the same array pi itself uses): npm/git/URL specs are
+/// installed into the image at bake time (one `pi install` each in the
+/// generated toolchain); local paths are baked in as-is via the pi config
+/// copy and never installed. Resolved at staging so a missing local
+/// package aborts the bake BEFORE the ~30-min prep boot.
+#[derive(Debug)]
+struct BakePackages {
+    /// Remote specs (npm:/git:/URL) in declared order.
+    installs: Vec<String>,
+    /// Local paths in declared order (informational — no script lines).
+    locals: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn resolve_bake_packages(pi_dir: &Path) -> Result<BakePackages, String> {
+    let mut pkgs = BakePackages { installs: Vec::new(), locals: Vec::new(), warnings: Vec::new() };
+    let settings = pi_dir.join("settings.json");
+    let raw = match std::fs::read_to_string(&settings) {
+        Ok(r) => r,
+        Err(_) => {
+            pkgs.warnings.push(format!(
+                "no settings.json in {} — no pi packages will be installed (only pi itself)",
+                pi_dir.display()
+            ));
+            return Ok(pkgs);
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("{} is not valid JSON: {e} — fix it before baking", settings.display()))?;
+    let declared = match v.get("packages") {
+        None => {
+            pkgs.warnings.push(format!(
+                "no packages declared in {} — only pi itself will be installed (npm global)",
+                settings.display()
+            ));
+            return Ok(pkgs);
+        }
+        Some(p) => p,
+    };
+    let arr = declared
+        .as_array()
+        .ok_or_else(|| format!("packages in {} must be an array of strings", settings.display()))?;
+    if arr.is_empty() {
+        pkgs.warnings.push(format!(
+            "no packages declared in {} — only pi itself will be installed (npm global)",
+            settings.display()
+        ));
+        return Ok(pkgs);
+    }
+    for (i, entry) in arr.iter().enumerate() {
+        let spec = entry
+            .as_str()
+            .ok_or_else(|| format!("packages[{}] in {} must be a string (got {entry})", i, settings.display()))?;
+        if spec.is_empty() {
+            pkgs.warnings.push(format!("packages[{}] in {} is empty — ignored", i, settings.display()));
+            continue;
+        }
+        if spec.starts_with("npm:")
+            || spec.starts_with("git:")
+            || spec.starts_with("http://")
+            || spec.starts_with("https://")
+        {
+            if !spec_is_script_safe(spec) {
+                return Err(format!(
+                    "package spec {spec} contains a character that would break the generated boot script"
+                ));
+            }
+            pkgs.installs.push(spec.to_string());
+        } else if spec.starts_with('/') {
+            if !Path::new(spec).exists() {
+                pkgs.warnings.push(format!(
+                    "local package {spec} not found on the host — it will be missing in the image unless it exists at that path in the guest (e.g. under /workspace)"
+                ));
+            }
+            pkgs.locals.push(spec.to_string());
+        } else {
+            let p = pi_dir.join(spec);
+            if !p.exists() {
+                return Err(format!(
+                    "local package {spec} not found ({}) — it must live inside the pi config dir to be baked in (pass --pi-dir pointing at the dir that contains it)",
+                    p.display()
+                ));
+            }
+            pkgs.locals.push(spec.to_string());
+        }
+    }
+    Ok(pkgs)
+}
+
+/// Remote specs are interpolated into the boot script (a YAML plain scalar
+/// wrapped in `bash -c '...'`) — reject anything that would break it.
+fn spec_is_script_safe(spec: &str) -> bool {
+    !spec.contains(['\'', '"', '`', '$', '#', '\n', '\r', '\t']) && !spec.contains(": ")
+}
+
+/// Log label for a package's install line: the package name (readable in
+/// bake-debug.log), shell-safe, collision-proof.
+fn install_label(spec: &str, i: usize, used: &mut Vec<String>) -> String {
+    let name = spec
+        .strip_prefix("npm:")
+        .or_else(|| spec.strip_prefix("git:"))
+        .unwrap_or(spec);
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let clean: String = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    let mut label = if clean.is_empty() { format!("pkg-{i}") } else { clean };
+    let mut n = 1;
+    while used.contains(&label) {
+        label = format!("{label}-{n}");
+        n += 1;
+    }
+    used.push(label.clone());
+    label
+}
+
+fn user_data(installs: &[String]) -> String {
     // Network for the prep boot (same as the per-VM runcmd, but logs to
     // /root/bake-net.log — the on-disk log the bake dumps on failure).
     let net = format!(
@@ -711,6 +849,21 @@ else
   echo "pi config NOT FOUND on ISO, iso9660 mount count $(mount | grep -c iso9660)";
 fi
 "#;
+    // The pi package installs (from the pi config's settings.json —
+    // resolve_bake_packages validated them at staging): between pi itself
+    // (npm global) and `pi update --extensions`, one block per remote spec.
+    let mut used_labels: Vec<String> = Vec::new();
+    let package_block: Vec<String> = installs
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let label = install_label(spec, i, &mut used_labels);
+            format!(
+                "(pi install {spec} 2>&1 | tail -1;\n echo \"{label} rc=${{PIPESTATUS[0]}}\") || true;"
+            )
+        })
+        .collect();
+    let package_block = package_block.join("\n");
     // The toolchain install (the long part) + bake marker + BAKE-SIGNAL.
     // NOTE: no `#` comments in this block — a `#` at the start of a
     // continuation line (or a mid-line ` #`) terminates the YAML plain
@@ -740,16 +893,9 @@ echo "pi-vm baking toolchain...";
  echo "dracut rc=${{PIPESTATUS[0]}}") || true;
 (timeout 300 npm install -g --ignore-scripts @earendil-works/pi-coding-agent 2>&1 | tail -3;
  echo "npm rc=${{PIPESTATUS[0]}}") || true;
-(pi install npm:pi-web-access 2>&1 | tail -1;
- echo "piw rc=${{PIPESTATUS[0]}}") || true;
-(pi install npm:pi-subagents 2>&1 | tail -1;
- echo "pis rc=${{PIPESTATUS[0]}}") || true;
-(pi install npm:pi-goal-x 2>&1 | tail -1;
- echo "pgx rc=${{PIPESTATUS[0]}}") || true;
+{package_block}
 (timeout 300 pi update --extensions 2>&1 | tail -3;
  echo "piupd rc=${{PIPESTATUS[0]}}") || true;
-grep -q SEARXNG_BASE_URL /etc/environment 2>/dev/null || echo "SEARXNG_BASE_URL=https://search.aandt.io/" >> /etc/environment;
-grep -q SEARXNG_BASE_URL /root/.bashrc 2>/dev/null || echo "export SEARXNG_BASE_URL=https://search.aandt.io/" >> /root/.bashrc;
 grep -q DefaultTimeoutStopSec /etc/systemd/system.conf 2>/dev/null || printf "DefaultTimeoutStopSec=30s\nFinalKillSignal=SIGKILL\n" >> /etc/systemd/system.conf;
 if command -v pi >/dev/null 2>&1; then
   touch /root/.pi-vm-setup-done;
@@ -1301,7 +1447,23 @@ fn guestfish_run(image: &std::path::Path, cmds: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{user_data, NET_SCRIPT};
+    use super::{resolve_bake_packages, user_data, NET_SCRIPT};
+
+    /// The standard pi config's package set (regression baseline: the old
+    /// hard-coded installs).
+    fn std_installs() -> Vec<String> {
+        ["npm:pi-web-access", "npm:pi-subagents", "npm:pi-goal-x"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    fn temp_pi_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pi-vm-bake-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("create temp pi dir");
+        d
+    }
 
     /// The generated user-data must stay valid YAML: each runcmd entry is
     /// a multi-line plain scalar (one `bash -c '...'` per entry) with no
@@ -1310,7 +1472,7 @@ mod tests {
     /// block), and exactly one opening + one closing single quote.
     #[test]
     fn user_data_runcmd_blocks_are_valid_yaml() {
-        let s = user_data();
+        let s = user_data(&std_installs());
         let entries: Vec<&str> = s
             .split("  - ")
             .map(|e| e.trim_start())
@@ -1330,7 +1492,7 @@ mod tests {
     /// attempt to sign — the guest has no gpg program).
     #[test]
     fn user_data_bakes_git_sandbox_config() {
-        let s = user_data();
+        let s = user_data(&std_installs());
         assert!(
             s.contains("HOME=/root git config --global --replace-all safe.directory \"*\""),
             "safe.directory must be disabled entirely in the baked image"
@@ -1359,6 +1521,130 @@ mod tests {
         }
         let o = child.wait_with_output().expect("wait");
         assert!(o.status.success(), "bash -n failed on NET_SCRIPT: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// The package block must sit between pi itself (npm global) and
+    /// `pi update --extensions`, in declared order; no specs -> no
+    /// `pi install` lines at all.
+    #[test]
+    fn user_data_installs_packages_between_pi_and_update() {
+        let s = user_data(&std_installs());
+        let npm = s.find("npm install -g").expect("npm line");
+        let (a, b, c) = (
+            s.find("pi install npm:pi-web-access").expect("web-access"),
+            s.find("pi install npm:pi-subagents").expect("subagents"),
+            s.find("pi install npm:pi-goal-x").expect("goal-x"),
+        );
+        let upd = s.find("pi update --extensions").expect("update line");
+        assert!(npm < a && a < b && b < c && c < upd, "wrong install order");
+        let e = user_data(&[]);
+        assert!(!e.contains("pi install "), "no specs must emit no install lines");
+    }
+
+    /// The toolchain block (with the generated package installs) must be a
+    /// valid shell — a stray quote/brace would brick the whole prep boot.
+    #[test]
+    fn user_data_toolchain_block_is_valid_shell() {
+        let s = user_data(&std_installs());
+        let entry = s
+            .split("  - ")
+            .map(|e| e.trim_start())
+            .filter(|e| e.starts_with("bash -c '"))
+            .find(|e| e.contains("pi-vm baking toolchain"))
+            .expect("toolchain runcmd entry");
+        let start = entry.find("bash -c '").unwrap() + "bash -c '".len();
+        let end = entry.rfind('\'').expect("closing quote");
+        let script = &entry[start..end];
+        use std::io::Write;
+        let mut child = std::process::Command::new("bash")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn bash");
+        {
+            let mut si = child.stdin.take().expect("stdin");
+            si.write_all(script.as_bytes()).expect("write");
+        }
+        let o = child.wait_with_output().expect("wait");
+        assert!(o.status.success(), "bash -n failed on toolchain block: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// Classification: remote specs (npm:/git:/URL) become install lines,
+    /// existing relative paths become locals, a missing absolute path only
+    /// warns (it may be valid in the guest via /workspace).
+    #[test]
+    fn resolve_packages_classifies_specs_and_validates_paths() {
+        let d = temp_pi_dir("classify");
+        std::fs::write(
+            d.join("settings.json"),
+            r#"{"packages":["npm:pi-web-access","git:github.com/x/y","https://github.com/x/z","./packages/local","/nonexistent-abs"]}"#,
+        )
+        .expect("write settings");
+        std::fs::create_dir_all(d.join("packages/local")).expect("mkdir local");
+        let p = resolve_bake_packages(&d).expect("resolve");
+        assert_eq!(p.installs, vec!["npm:pi-web-access", "git:github.com/x/y", "https://github.com/x/z"]);
+        assert_eq!(p.locals, vec!["./packages/local", "/nonexistent-abs"]);
+        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings[0].contains("/nonexistent-abs"), "{}", p.warnings[0]);
+    }
+
+    /// A missing RELATIVE local path aborts the bake at staging — it would
+    /// silently be absent from the image otherwise.
+    #[test]
+    fn resolve_packages_missing_local_path_errors() {
+        let d = temp_pi_dir("missing-local");
+        std::fs::write(d.join("settings.json"), r#"{"packages":["./packages/nope"]}"#).expect("write settings");
+        let e = resolve_bake_packages(&d).expect_err("must error");
+        assert!(e.contains("./packages/nope"), "{e}");
+        assert!(e.contains("--pi-dir"), "{e}");
+    }
+
+    /// No settings.json / no packages key / empty array -> warning only,
+    /// no installs (no fallback — the pi config is the source of truth).
+    #[test]
+    fn resolve_packages_no_packages_warns_only() {
+        let d = temp_pi_dir("no-settings");
+        let p = resolve_bake_packages(&d).expect("resolve");
+        assert!(p.installs.is_empty() && p.locals.is_empty());
+        assert_eq!(p.warnings.len(), 1);
+        for (name, body) in [
+            ("no-key", r#"{"defaultModel":"x"}"#),
+            ("empty", r#"{"packages":[]}"#),
+        ] {
+            let d = temp_pi_dir(name);
+            std::fs::write(d.join("settings.json"), body).expect("write settings");
+            let p = resolve_bake_packages(&d).expect("resolve");
+            assert!(p.installs.is_empty(), "{name}");
+            assert_eq!(p.warnings.len(), 1, "{name}");
+        }
+    }
+
+    /// Malformed settings must fail fast at staging (not silently bake).
+    #[test]
+    fn resolve_packages_malformed_settings_errors() {
+        for (name, body) in [
+            ("bad-json", "{nope"),
+            ("not-array", r#"{"packages":"npm:x"}"#),
+            ("not-string", r#"{"packages":[1]}"#),
+        ] {
+            let d = temp_pi_dir(name);
+            std::fs::write(d.join("settings.json"), body).expect("write settings");
+            assert!(resolve_bake_packages(&d).is_err(), "{name} must error");
+        }
+    }
+
+    /// Specs that would break the generated boot script are rejected at
+    /// staging (`#` comments the line out in the YAML plain scalar; quotes
+    /// unbalance the `bash -c '...'` wrap).
+    #[test]
+    fn resolve_packages_unsafe_spec_chars_error() {
+        for (name, spec) in [("hash", "npm:bad#spec"), ("colon-space", "git: a spec"), ("quote", r#"npm:bad'spec"#)] {
+            let d = temp_pi_dir(name);
+            std::fs::write(d.join("settings.json"), format!(r#"{{"packages":["{spec}"]}}"#)).expect("write settings");
+            assert!(resolve_bake_packages(&d).is_err(), "{name} must error");
+        }
     }
 }
 
